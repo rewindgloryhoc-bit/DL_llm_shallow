@@ -22,6 +22,7 @@ class BPETokenizer:
                 self.vocab_dict = pickle.load(vocab)
             with open (self.merges_path, 'rb') as merges:
                 self.merges = pickle.load(merges)
+            return
         #else if no data exist
         vocab_dict, merges = tokenizer_parallel.tokenization(self.vocab_size, self.input_path, self.special_token)
         self.trained = True

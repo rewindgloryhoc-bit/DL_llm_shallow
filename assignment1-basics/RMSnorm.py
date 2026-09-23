@@ -13,7 +13,13 @@ class RMSnorm(torch.nn.Module):
         else:
             self.gi = nn.Parameter(gi)
 
-    def forward(self, x: torch.Tensor): #[seq, d_model]
+    
+    def forward(self, x: torch.Tensor): #[seq, d_model])
+        rms_scale = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * rms_scale * self.gi
+    
+
+    def forward_bfloat16(self, x: torch.Tensor): #[seq, d_model]
         in_dtype = x.dtype
         x32p = x.to(torch.float32)
         normalizer = torch.rsqrt(torch.mean(x32p ** 2, dim=-1, keepdim=True) + self.eps)

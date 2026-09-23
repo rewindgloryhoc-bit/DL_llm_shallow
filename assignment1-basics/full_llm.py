@@ -22,15 +22,24 @@ class Full_llm(torch.nn.Module):
         self.embedding = Embedding(vocab_size, d_model, device=self.device, dtype=self.dtype)
 
         self.layers = torch.nn.ModuleList([
-            Sublayer(self.d_model, self.d_head, self.d_ff, self.theta, weights)
+            Sublayer(
+                self.d_model,
+                self.num_heads,
+                self.d_ff,
+                self.max_seq_len,
+                self.theta,
+                weights,
+                device=self.device,
+                dtype=self.dtype,
+            )
             for _ in range(num_layers)
         ])
 
-        self.Wrmf = RMSnorm(self.d_model, gi=None, eps=1e-5, device=self.device, dtype=torch.float16T)
-        Wf = torch.empty(self.d_model, vocab_size, dtype=torch.float16, device=self.device)
+        self.Wrmf = RMSnorm(self.d_model, gi=None, eps=1e-5, device=self.device, dtype=self.dtype)
+        # Shape matches adapters' lm_head.weight: (vocab_size, d_model)
+        Wf = torch.empty(vocab_size, self.d_model, dtype=self.dtype, device=self.device)
         Wf = torch.nn.init.trunc_normal_(Wf)
-        Wlm = torch.nn.Parameter(Wf, requires_grad=True)
-        self.Wlm = Wlm
+        self.Wlm = torch.nn.Parameter(Wf, requires_grad=True)
 
 
     #note x here refers to encoded prompt.
@@ -39,11 +48,5 @@ class Full_llm(torch.nn.Module):
         for sublayer in self.layers:
             x = sublayer(x)
         final_x = self.Wrmf(x)
-        logits = final_x * self.Wlm.T
+        logits = final_x @ self.Wlm.T
         return logits
-
-
-
-
-
-

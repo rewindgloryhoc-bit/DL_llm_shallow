@@ -17,5 +17,3 @@ class Embedding(torch.nn.Module):
         #toke_ids in shape [batch, seq_length], which is 2D
         #returns a result in shape [batch, seq, d_model]
         return self.embedding[token_ids]
-
-

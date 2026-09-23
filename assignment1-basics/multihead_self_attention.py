@@ -24,10 +24,12 @@ class MultiHeadSelfAttention(torch.nn.Module):
 
     #this function does not actually calculate attention score
     def forward(self, x, token_positions=None):
-        seq_len = x.size(-2)
         if self.mask is None:
-            causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=self.device))
+            mask_device = self.device if self.device is not None else x.device
+            causal_mask = torch.tril(torch.ones(self.max_seq, self.max_seq, dtype=torch.bool, device=mask_device))
             self.mask = causal_mask
+        seq_len = x.size(-2)
+        mask = self.mask[:seq_len, :seq_len]
         q = x @ self.Wq.T
         k = x @ self.Wk.T
         v = x @ self.Wv.T
@@ -46,7 +48,7 @@ class MultiHeadSelfAttention(torch.nn.Module):
             qi = self.RoPE(query, token_positions)
             ki = self.RoPE(key, token_positions)
 
-        attention = sca.scaled_attention(qi, ki, value, mask=self.mask)
+        attention = sca.scaled_attention(qi, ki, value, mask=mask)
         flat_att = einops.rearrange(attention, "... head seq hd -> ... seq (head hd)")
         projection = flat_att @ self.Wo.T
         return projection

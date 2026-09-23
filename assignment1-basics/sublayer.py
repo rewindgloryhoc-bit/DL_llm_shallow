@@ -6,7 +6,8 @@ from positionwise_feedforward import SwiGLU
 
 
 class Sublayer(torch.nn.Module):
-    def __init(self, d_model, num_heads, d_ff, max_seq_len, theta, weights=None, device=None, dtype=None):
+    def __init__(self, d_model, num_heads, d_ff, max_seq_len, theta, weights=None, device=None, dtype=None):
+        super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_ff = d_ff
@@ -30,11 +31,19 @@ class Sublayer(torch.nn.Module):
         else:
             self.rms_norm1 = rm.RMSnorm(d_model, eps=1e-5, device=self.device, dtype=self.dtype)
             self.rms_norm2 = rm.RMSnorm(d_model, eps=1e-5, device=self.device, dtype=self.dtype)
+            Wq = torch.empty(d_model, d_model, device=self.device, dtype=self.dtype)
+            Wk = torch.empty(d_model, d_model, device=self.device, dtype=self.dtype)
+            Wv = torch.empty(d_model, d_model, device=self.device, dtype=self.dtype)
+            Wo = torch.empty(d_model, d_model, device=self.device, dtype=self.dtype)
+            torch.nn.init.trunc_normal_(Wq)
+            torch.nn.init.trunc_normal_(Wk)
+            torch.nn.init.trunc_normal_(Wv)
+            torch.nn.init.trunc_normal_(Wo)
             self.attn = MHSA.MultiHeadSelfAttention(
                 d_model,
                 num_heads,
                 self.max_seq_len,
-                self.theta,
+                Wq, Wk, Wv, Wo, self.theta,
                 mask=None, device=self.device, dtype=self.dtype
             )
             self.FFN = SwiGLU(d_model, dff=d_ff, device=self.device, dtype=self.dtype)

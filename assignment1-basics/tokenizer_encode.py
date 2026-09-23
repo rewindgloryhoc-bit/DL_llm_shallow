@@ -2,6 +2,7 @@
 import pickle
 from token_encoding import token_encode, token_decode
 import tokenization_script
+from pathlib import Path
 
 
 '''
@@ -31,6 +32,18 @@ class Encoder:
 
 
     def encode(self, input_path, out_bin):
+        out_path = Path(out_bin)
+        if out_path.is_file():
+            size = out_path.stat().st_size
+            head = out_path.read_bytes()[:1]
+            is_pickle = head.startswith(b"\x80")
+            valid_raw = (size % 2 == 0) and (not is_pickle)
+            if valid_raw:
+                print("File already exists, no encoding needed")
+                return
+            if is_pickle:
+                print("Legacy pickled encoding found; converting on first batch load")
+                return
         if self.special_tokens:
             sorted_specials = sorted(self.special_tokens, key=len, reverse=True)
             out_bin, len_encoded, len_bytes = tokenization_script.encode_parallel(

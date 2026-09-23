@@ -13,6 +13,13 @@ from check_point import save_checkpoint, load_checkpoint
 import signal
 import sys
 from softmax import softmax
+import tempfile
+import time
+import matplotlib.pyplot as plt
+from nucleus import nucleus_generation
+
+
+
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -24,6 +31,7 @@ merges_path1 = BASE_DIR / "token_data" / "merges_TinyStories.pkl"
 vocab_path2 = BASE_DIR / "token_data" / "vocabulary_owt_train.pkl"
 merges_path2 = BASE_DIR / "token_data" / "merges_owt_train.pkl"
 
+#change this path later, should not be in pkl. earlier legacy to be corrected
 encoded_path1 = BASE_DIR / "token_data" / "encoded_TinyStories.pkl"
 encoded_path2 = BASE_DIR / "token_data" / "encoded_owt_train.pkl"
 
@@ -34,42 +42,50 @@ checkpoint_dir.mkdir(parents=True, exist_ok=True)
 checkpoint_path = checkpoint_dir / "latest_model_checkpoint.pt"
 
 
-num_epochs = 100
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-dtype = torch.bfloat16
-lr = 3e-5
-Tw = num_epochs // 10
-Tc = num_epochs  - Tw
+step_size = 5000
+device = torch.device('mps')
+dtype = torch.float32
 
 
 class LLM_train:
     def __init__(
-            self, input_path, d_model, batch_size, num_heads, max_seq, theta, lr, beta, lamda, device, dtype, vocab_size, num_layer):
+            self, input_path, d_model, batch_size, num_heads, max_seq, theta, lr_min, lr_max, Tw, Tc, lamda, device, dtype, vocab_size, num_layer, dff=None):
         self.input_path = input_path
         self.d_model = d_model
         self.batch_size = batch_size
         self.num_heads = num_heads
         self.max_seq = max_seq
         self.theta = theta
-        self.lr = lr
-        self.beta = beta
-        self.lamda = lamda
+        self.lr_min = lr_min
+        self.lr_max = lr_max
+        self.Tw = Tw
+        self.Tc = Tc
+        self.weight_decay = lamda
         self.device = device
         self.dtype = dtype
         self.vocab_size = vocab_size
-        self.current_epoch = 0
-        self.layers=num_layer
-
-        d_ff = (8 / 3 * self.d_model) // 64 * 64
+        self.current_step = 0
+        self.layers = num_layer
+        if dff is None:
+            self.d_ff = int((8 / 3 * self.d_model) // 64 * 64)
+        else:
+            self.d_ff = dff
         self.transformer = Full_llm(
-            self.d_model, self.num_heads, d_ff, self.max_seq, self.theta, self.layers, vocab_size, weights=None,
+            self.d_model, self.num_heads, self.d_ff, self.max_seq, self.theta, self.layers, vocab_size, weights=None,
             device=device, dtype=dtype
         ).to(device)
 
-        self.optimizer = Adam_W(self.transformer.parameters(), lr=self.lr, weight_decay=self.lamda)
+        self.optimizer = Adam_W(
+            self.transformer.parameters(),
+            lr_min=self.lr_min,
+            lr_max=self.lr_max,
+            weight_decay=self.weight_decay,
+            Tw=self.Tw,
+            Tc=self.Tc,
+        )
 
         self.bpe_tokenizer = BPETokenizer(
-            self.input_path, vocab_size, vocab_path2, merges_path2, special_token=["<|endoftext|>"]
+            self.input_path, vocab_size, vocab_path1, merges_path1, special_token=["<|endoftext|>"]
         )
         self.bpe_tokenizer.bpe_train()
         if self.bpe_tokenizer.trained:
@@ -95,13 +111,13 @@ class LLM_train:
         save_checkpoint(
             self.transformer,
             self.optimizer,
-            self.current_epoch,
+            self.current_step,
             checkpoint_path
         )
 
     def load_checkpoint(self):
-        start_epoch = load_checkpoint(checkpoint_path, self.transformer, self.optimizer)
-        return start_epoch
+        start_step = load_checkpoint(checkpoint_path, self.transformer, self.optimizer)
+        return start_step
 
     def forward(self):
         #profiler block to check encoding
@@ -114,20 +130,27 @@ class LLM_train:
         print("encoding complete")
 
         if Path(checkpoint_path).is_file():
-            self.current_epoch = self.load_checkpoint()
+            self.current_step = self.load_checkpoint()
+        self.transformer = torch.compile(self.transformer, backend="aot_eager")
         self.transformer.train()
 
-        for epoch in range(self.current_epoch, num_epochs):
-            self.current_epoch = epoch
+        lr_set = []
+        loss_set = []
+        for step in range(self.current_step, step_size):
+            self.current_step = step
             input_seq, target_label = run_get_batch(out_bin, self.batch_size, self.max_seq, self.device)
             logits = self.transformer(input_seq)
             loss = cross_entropy(logits, target_label)
+            loss_set.append(loss.item())
             self.optimizer.zero_grad()
             loss.backward()
             gradient_clipping(self.transformer.parameters(), M=1)
             self.optimizer.step()
-            print(f"Loss: {loss.item():.4f}")
-        return self.transformer
+            lr = self.optimizer.param_groups[0]["lr"]
+            lr_set.append(lr)
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            print(f"[{stamp}] step={step} lr={lr:.6e} loss={loss.item():.4f}")
+        return self.transformer, lr_set, loss_set
 
     '''
     #naive text generation
@@ -155,61 +178,115 @@ class LLM_train:
 
     '''
 
-    def nucleus_generation(self, limit=None, p=0.91):
-        prompt = input('enter prompt for text generation:')
-        encoded_prompt = self.encoder.encode_prompt(prompt)
-        encoded_tensor = torch.tensor([encoded_prompt], dtype=torch.long, device=self.device)
-        self.transformer.eval()
-        with torch.no_grad():
-            i = 0
-            while True:
-                x = self.transformer(encoded_tensor)
-                #last row is [,vocab_size]
-                last_row = x[0, -1, :]
-                sorted_row, indices = torch.sort(last_row, descending=True)
-                pi = softmax(sorted_row, i=-1)
-                sum_ps = 0
-                for idx, val in enumerate(pi):
-                    sum_ps += val.item()
-                    if sum_ps > p:
-                        break
-                last_idx = idx + 1
-                sorted_row[last_idx:] = float('-inf')
-                pi_normalized = softmax(sorted_row, i=-1)
-                #sample index should be in [,1]
-                # add batch dimension
-                sampled_index = torch.multinomial(pi_normalized, 1)
-                token_int = indices[sampled_index.item()].item()
-                #avoid scalar indexing here
-                token = indices[sampled_index].unsqueeze(0)
-                new_word = self.encoder.decode(token_int)
-                if new_word == '<|endoftext|>':
-                    break
-                print(new_word, end=' ', flush=True)
-                i += 1
-                if limit is not None and i >= limit:
-                    break
-                #stack the encoded tensor on seq dimension
-                encoded_tensor = torch.cat([encoded_tensor, token], dim=-1).to(self.device)
-            return f"generated text of length{i}"
+    def text_generation(self, prompt=None, limit=256, p=0.91):
+        self.load_checkpoint()
+        nucleus_generation(self.encoder, self.transformer, self.device, self.max_seq, prompt, limit, p)
+
+
+
+
+
+
+def dry_run(steps: int = 2):
+    """Synthetic forward/backward smoke test — no tokenizer or real dataset."""
+    dry_device = torch.device("cpu")
+    dry_dtype = torch.float32
+    d_model = 64
+    num_heads = 4
+    max_seq = 32
+    batch_size = 2
+    vocab_size = 128
+    num_layers = 2
+    theta = 10000.0
+    d_ff = int((8 / 3 * d_model) // 64 * 64) or 128
+
+    print(
+        f"dry-run: d_model={d_model}, heads={num_heads}, seq={max_seq}, "
+        f"batch={batch_size}, vocab={vocab_size}, layers={num_layers}, steps={steps}"
+    )
+
+    model = Full_llm(
+        d_model, num_heads, d_ff, max_seq, theta, num_layers, vocab_size,
+        weights=None, device=dry_device, dtype=dry_dtype,
+    ).to(dry_device)
+    optimizer = Adam_W(model.parameters(), lr_min=1e-3, Tw=1, Tc=10, lr_max=3e-3)
+    model.train()
+
+    for step in range(steps):
+        input_seq = torch.randint(0, vocab_size, (batch_size, max_seq), device=dry_device)
+        target_label = torch.randint(0, vocab_size, (batch_size, max_seq), device=dry_device)
+        logits = model(input_seq)
+        assert logits.shape == (batch_size, max_seq, vocab_size), logits.shape
+        loss = cross_entropy(logits, target_label)
+        assert torch.isfinite(loss), f"non-finite loss at step {step}: {loss}"
+        optimizer.zero_grad()
+        loss.backward()
+        gradient_clipping(model.parameters(), M=1)
+        optimizer.step()
+        print(f"dry-run step {step}: loss={loss.item():.4f}")
+
+    with tempfile.TemporaryDirectory(dir=checkpoint_dir) as tmp:
+        ckpt = Path(tmp) / "dry_run_checkpoint.pt"
+        save_checkpoint(model, optimizer, iteration=steps, out=ckpt)
+        load_checkpoint(ckpt, model, optimizer)
+        print(f"dry-run checkpoint ok: {ckpt.name}")
+
+    print("dry-run passed")
 
 
 def main():
     training = LLM_train(
         input_path=input_path1,
         d_model=512,
-        batch_size=32,
+        batch_size=64,
         num_heads=16,
         max_seq=256,
         theta=10000,
-        lr=lr,
-        beta=None,
-        lamda=None,
+        lr_min=8e-4,
+        lr_max=8e-3,
+        Tw=500,
+        Tc=5000,
+        lamda=0.1,
         device=device,
         dtype=dtype,
         vocab_size=10000,
-        num_layer=4
+        num_layer=4,
+        dff=1344,
+    )
+    transformer, lr_set, loss_set = training.forward()
+    plt.plot(lr_set, loss_set)
+    plt.xlabel('lr')
+    plt.ylabel('loss')
+    plt.title('lr vs loss')
+    plt.show()
+
+def text_generation(prompt=None, limit=256, p=0.91):
+    training = LLM_train(
+    input_path=input_path1,
+    d_model=512,
+    batch_size=64,
+    num_heads=16,
+    max_seq=256,
+    theta=10000,
+    lr_min=8e-4,
+    lr_max=8e-3,
+    Tw=500,
+    Tc=5000,
+    lamda=0.1,
+    device=device,
+    dtype=dtype,
+    vocab_size=10000,
+    num_layer=4,
+    dff=1344,
     )
 
-    training.forward()
+    training.text_generation(prompt, limit, p)
 
+
+if __name__ == "__main__":
+    if "--dry-run" in sys.argv:
+        dry_run()
+    elif "--text-generation" in sys.argv:
+        text_generation()
+    else:
+        main()

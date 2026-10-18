@@ -2,6 +2,7 @@ from RMSnorm import RMSnorm
 import torch
 from sublayer import Sublayer
 from embedding import Embedding
+from RotaryPositionalEmbedding import RotaryPositionalEmbedding
 '''
     out = x + Multi-head_attention(RMSnorm(x)), with RoPE
     x ~ [batch sequence h_d]
@@ -21,6 +22,9 @@ class Full_llm(torch.nn.Module):
 
         self.embedding = Embedding(vocab_size, d_model, device=self.device, dtype=self.dtype)
 
+        # One RoPE cache shared by every layer (mixture attention rotates half of each head).
+        self.rope = RotaryPositionalEmbedding(self.theta, self.d_head // 2, self.max_seq_len, device=self.device)
+
         self.layers = torch.nn.ModuleList([
             Sublayer(
                 self.d_model,
@@ -29,13 +33,15 @@ class Full_llm(torch.nn.Module):
                 self.max_seq_len,
                 self.theta,
                 weights,
+                rope=self.rope,
                 device=self.device,
                 dtype=self.dtype,
             )
             for _ in range(num_layers)
         ])
 
-        self.Wrmf = RMSnorm(self.d_model, gi=None, eps=1e-5, device=self.device, dtype=self.dtype)
+        # Final RMSNorm gain stays fp32 regardless of model dtype.
+        self.Wrmf = RMSnorm(self.d_model, gi=None, eps=1e-5, device=self.device, dtype=torch.float32)
         # Shape matches adapters' lm_head.weight: (vocab_size, d_model)
         Wf = torch.empty(vocab_size, self.d_model, dtype=self.dtype, device=self.device)
         Wf = torch.nn.init.trunc_normal_(Wf)

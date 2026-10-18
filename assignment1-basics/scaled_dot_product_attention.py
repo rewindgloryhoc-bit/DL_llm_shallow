@@ -12,10 +12,12 @@ dangerous einsum diagonal indexing, avoid [... x x] notation which extracts the 
 #note mask has dim (seq_len, seq_len)
 def scaled_attention(query, keys, values, mask):
     d_k = query.size(-1)
+    out_dtype = values.dtype
     attention = query @ keys.transpose(-2, -1)
     attention_scaled = attention / math.sqrt(d_k)
     attention_masked = attention_scaled.masked_fill(~mask, float("-inf"))
-    normalized_attention = softmax(attention_masked, -1)
+    # Only softmax is precision-sensitive; cast back for attn @ V.
+    normalized_attention = softmax(attention_masked.float(), -1).to(out_dtype)
     attention_score = einops.einsum(
         normalized_attention, values, "batch ... q k, batch ... k dv -> batch ... q dv"
     ) #previously [batch ... seq seq, batch ... seq d_model -> seq d_model]

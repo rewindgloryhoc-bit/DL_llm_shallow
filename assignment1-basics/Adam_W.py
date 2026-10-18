@@ -1,10 +1,12 @@
-import torch
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from typing import Optional
-from cos_annealing import cos_annealing
+import math
+import torch
+from cos_annealing import scheduled_lr
 
 
 class Adam_W(torch.optim.Optimizer):
+
     def __init__(
         self,
         params,
@@ -15,6 +17,11 @@ class Adam_W(torch.optim.Optimizer):
         lr_max=1e-3,
         Tw=500,
         Tc=5000,
+        decay_steps=1200,
+        schedule_mode="iter",
+        Tw_sec=None,
+        T_budget=None,
+        decay_sec=None,
     ):
         if betas is None:
             betas = (0.9, 0.98)
@@ -24,7 +31,7 @@ class Adam_W(torch.optim.Optimizer):
             weight_decay = 0.01
 
         defaults = {
-            "lr": lr_min,  # current scheduled lr (updated each step)
+            "lr": lr_min,
             "lr_min": lr_min,
             "betas": betas,
             "eps": eps,
@@ -32,43 +39,71 @@ class Adam_W(torch.optim.Optimizer):
             "lr_max": lr_max,
             "Tw": Tw,
             "Tc": Tc,
+            "decay_steps": decay_steps,
+            "schedule_mode": schedule_mode,
+            "Tw_sec": Tw_sec,
+            "T_budget": T_budget,
+            "decay_sec": decay_sec,
+            "train_start_time": None,
         }
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None):
         loss = None if closure is None else closure()
+
         for group in self.param_groups:
-            lr_min = group["lr_min"]
-            beta1 = group["betas"][0]
-            beta2 = group["betas"][1]
+            # Hyperparameters
+            beta1, beta2 = group["betas"]
             eps = group["eps"]
             weight_decay = group["weight_decay"]
-            lr_max = group["lr_max"]
-            Tw = group["Tw"]
-            Tc = group["Tc"]
+
+            # Shared step counter (still used for Adam bias correction).
+            t = group.get("t", 0) + 1
+            group["t"] = t
+
+            # iter → cos_annealing(t); time → cos_annealing_time(elapsed)
+            lr = scheduled_lr(group, t)
+            group["lr"] = lr
+
+            bias_n1 = 1.0 - (beta1**t)
+            bias_n2 = 1.0 - (beta2**t)
+
+            step_size = lr * (math.sqrt(bias_n2) / bias_n1)
+            eps_hat = eps * math.sqrt(bias_n2)
+
             for p in group["params"]:
                 if p.grad is None:
                     continue
+                state = self.state[p]
+                p_fp32 = p.data.float()
+                grad = p.grad.data.float()
 
-                state = self.state[p]  # Get state associated with p.
-                t = state.get("t", 0) + 1 # Get iteration number from state, or 0.
-                lr = cos_annealing(t, lr_min, lr_max, Tw, Tc)
-                group["lr"] = lr
                 if "m" not in state:
-                    state["m"] = torch.zeros_like(p.data)
-                    state["v"] = torch.zeros_like(p.data)
+                    state["m"] = torch.zeros_like(p_fp32)
+                    state["v"] = torch.zeros_like(p_fp32)
+
                 m = state["m"]
                 v = state["v"]
-                bias_n1 = beta1 ** t
-                bias_n2 = beta2 ** t
-                grad = p.grad.data
-                momentum = ((beta1 * m) + (1 - beta1) * grad)
-                momentum_p2 = ((beta2 * v) + (1 - beta2) * grad ** 2)
-                unit = (momentum / (1 - bias_n1))  / (torch.sqrt(momentum_p2  / (1 - bias_n2)) + eps)
-                p.data -= (lr * weight_decay * p.data) + (lr * unit)
-                state["t"] = t
+
+                # Momentum updates in FP32
+                momentum = (beta1 * m) + ((1.0 - beta1) * grad)
+                momentum_p2 = (beta2 * v) + ((1.0 - beta2) * (grad**2))
+
+                # Compute update unit
+                unit = momentum / (torch.sqrt(momentum_p2) + eps_hat)
+
+                # Decoupled weight decay + Adam update
+                p_fp32 = (
+                    p_fp32 - (lr * weight_decay * p_fp32) - (step_size * unit)
+                )
+
+                # Write downcasted parameters back to low precision (e.g., BF16)
+                p.data.copy_(p_fp32)
+
+                # Store FP32 momentum moments in parameter state
                 state["m"] = momentum
                 state["v"] = momentum_p2
+
         return loss
 
 

@@ -22,15 +22,15 @@ class RotaryPositionalEmbedding(torch.nn.Module):
         x1 = pairs[..., 0] #becomes [... seq_len, d/2]
         x2 = pairs[..., 1]
 
-        cos = self.cos_cached[token_positions, :] #becomes [... some_seq, d]
+        #note both rotary matrix has shape with 2D excluding batch dimension
+        cos = self.cos_cached[token_positions, :] #becomes [... some_seq, d/2]
         sin = self.sin_cached[token_positions, :]
-        '''
-        if cos.ndim < x.ndim:
-            cos = cos.unsqueeze(-2)  # [batch, 1, seq, d_k // 2]
-            sin = sin.unsqueeze(-2)
-        '''
-        xr1 = x1 * cos - x2 * sin
-        xr2 = x2 * cos + x1 * sin
+
+        # Trig caches are fp32; rotate in fp32 then cast back to x's dtype (e.g. bf16).
+        in_dtype = x.dtype
+        x1f, x2f = x1.float(), x2.float()
+        xr1 = x1f * cos - x2f * sin
+        xr2 = x2f * cos + x1f * sin
         x_out = torch.stack([xr1, xr2], dim=-1).flatten(start_dim=-2)
-        return x_out
+        return x_out.to(in_dtype)
 

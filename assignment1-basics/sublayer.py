@@ -6,7 +6,7 @@ from positionwise_feedforward import SwiGLU
 
 
 class Sublayer(torch.nn.Module):
-    def __init__(self, d_model, num_heads, d_ff, max_seq_len, theta, weights=None, device=None, dtype=None):
+    def __init__(self, d_model, num_heads, d_ff, max_seq_len, theta, weights=None, rope=None, device=None, dtype=None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -18,19 +18,19 @@ class Sublayer(torch.nn.Module):
 
         if weights is not None:
             Wq, Wk, Wv, Wo, Wg1, W1, W2, W3, Wg2 = weights.values()
-            self.rms_norm1 = rm.RMSnorm(d_model, gi=Wg1, eps=1e-5, device=self.device, dtype=self.dtype)
-            self.rms_norm2 = rm.RMSnorm(d_model, gi=Wg2, eps=1e-5, device=self.device, dtype=self.dtype)
+            self.rms_norm1 = rm.RMSnorm(d_model, gi=Wg1, eps=1e-5, device=self.device, dtype=torch.float32)
+            self.rms_norm2 = rm.RMSnorm(d_model, gi=Wg2, eps=1e-5, device=self.device, dtype=torch.float32)
             self.attn = MHSA.MultiHeadSelfAttention(
                 d_model,
                 num_heads,
                 self.max_seq_len,
                 Wq, Wk, Wv, Wo, self.theta,
-                mask=None, device=self.device, dtype=self.dtype
+                mask=None, rope=rope, device=self.device, dtype=self.dtype
             )
             self.FFN = SwiGLU(d_model, w1=W1, w2=W2, w3=W3, dff=d_ff, device=self.device, dtype=self.dtype)
         else:
-            self.rms_norm1 = rm.RMSnorm(d_model, eps=1e-5, device=self.device, dtype=self.dtype)
-            self.rms_norm2 = rm.RMSnorm(d_model, eps=1e-5, device=self.device, dtype=self.dtype)
+            self.rms_norm1 = rm.RMSnorm(d_model, eps=1e-5, device=self.device, dtype=torch.float32)
+            self.rms_norm2 = rm.RMSnorm(d_model, eps=1e-5, device=self.device, dtype=torch.float32)
             Wq = torch.empty(d_model, d_model, device=self.device, dtype=self.dtype)
             Wk = torch.empty(d_model, d_model, device=self.device, dtype=self.dtype)
             Wv = torch.empty(d_model, d_model, device=self.device, dtype=self.dtype)
@@ -44,7 +44,7 @@ class Sublayer(torch.nn.Module):
                 num_heads,
                 self.max_seq_len,
                 Wq, Wk, Wv, Wo, self.theta,
-                mask=None, device=self.device, dtype=self.dtype
+                mask=None, rope=rope, device=self.device, dtype=self.dtype
             )
             self.FFN = SwiGLU(d_model, dff=d_ff, device=self.device, dtype=self.dtype)
 

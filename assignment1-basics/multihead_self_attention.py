@@ -1,12 +1,19 @@
 import torch.nn as nn
 import torch
 from RotaryPositionalEmbedding import RotaryPositionalEmbedding as RoPE
-import scaled_dot_product_attention as sca
-import einops
+import mixture_RoPE as mr
+import scaled_dot_product_attention as sdpa
 
 
+''' 
+note that this clsas takes in custom rope class, but only to be used 
+as cos and sin matrices which serves mixture RoPE.
+'''
 class MultiHeadSelfAttention(torch.nn.Module):
-    def __init__(self, d_model, num_heads, max_seq, Wq, Wk, Wv, Wo, rope_theta, mask=None, device=None, dtype=None):
+    #(q, k, v, mask) -> attention output; subclasses may swap in another implementation
+    attention_fn = staticmethod(sdpa.scaled_attention)
+
+    def __init__(self, d_model, num_heads, max_seq, Wq, Wk, Wv, Wo, rope_theta, mask=None, rope=None, device=None, dtype=None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -19,7 +26,10 @@ class MultiHeadSelfAttention(torch.nn.Module):
         self.theta = rope_theta
         self.max_seq = max_seq
         self.d_heads = self.d_model // self.num_heads
-        self.RoPE = RoPE(self.theta, self.d_heads, self.max_seq, device=device)
+        # RoPE only rotates the first half of each head; may be shared across layers.
+        if rope is None:
+            rope = RoPE(self.theta, self.d_heads // 2, self.max_seq, device=device)
+        self.RoPE = rope
         self.mask = mask
 
     #this function does not actually calculate attention score
@@ -39,17 +49,9 @@ class MultiHeadSelfAttention(torch.nn.Module):
         value = torch.unflatten(v, dim=-1, sizes=[-1, self.d_heads]).transpose(-3, -2)
 
         if token_positions is None:
-            tpq = torch.arange(query.size(-2), device=x.device)
-            tpk = torch.arange(key.size(-2), device=x.device)
-            qi = self.RoPE(query, tpq)
-            ki = self.RoPE(key, tpk)
+            token_positions = torch.arange(query.size(-2), device=x.device)
 
-        else:
-            qi = self.RoPE(query, token_positions)
-            ki = self.RoPE(key, token_positions)
-
-        attention = sca.scaled_attention(qi, ki, value, mask=mask)
-        flat_att = einops.rearrange(attention, "... head seq hd -> ... seq (head hd)")
-        projection = flat_att @ self.Wo.T
+        attention = mr.mixture_RoPE(query, key, value, self.RoPE, token_positions, mask, self.attention_fn)
+        projection = attention @ self.Wo.T
         return projection
 

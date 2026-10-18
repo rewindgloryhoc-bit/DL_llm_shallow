@@ -2,6 +2,16 @@ import torch
 import math
 import torch.nn as nn
 
+
+def swiglu_torch(x, w1, w2, w3):
+    s1 = x @ w1.T
+    SiLU = s1 * torch.sigmoid(s1)
+    GLU = x @ w3.T
+    product = SiLU * GLU
+    swiglu = product @ w2.T
+    return swiglu
+
+
 class SwiGLU(torch.nn.Module):
     def __init__(self, d_model, w1=None, w2=None, w3=None, dff=None, device=None, dtype=None):
         super().__init__()
@@ -24,9 +34,4 @@ class SwiGLU(torch.nn.Module):
             self.w3 = nn.Parameter(w3)
 
     def forward(self, x:torch.Tensor):
-        s1 = x @ self.w1.T
-        SiLU = s1 * torch.sigmoid(s1)
-        GLU = x @ self.w3.T
-        product = SiLU * GLU
-        swiglu = product @ self.w2.T
-        return swiglu
+        return swiglu_torch(x, self.w1, self.w2, self.w3)

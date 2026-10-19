@@ -56,6 +56,7 @@ def resolve_dataset(name):
             "merges_path": merges_path1,
             "encoded_path": encoded_path1,
             "out_bin": encoded_path1,
+            "vocab_size": 10000,
         }
     if name == "opentext":
         return {
@@ -65,6 +66,7 @@ def resolve_dataset(name):
             "merges_path": merges_path2,
             "encoded_path": encoded_path2,
             "out_bin": encoded_path2,
+            "vocab_size": 32000,
         }
     raise ValueError(f"unknown dataset {name!r}; choose from {DATASET_CHOICES}")
 
@@ -101,7 +103,7 @@ def d_ff_from_d_model(d_model):
 
 class LLM_train:
     def __init__(
-            self, input_path, d_model, batch_size, num_heads, max_seq, theta, lr_min, lr_max, Tw, Tc, lamda, device, dtype, vocab_size, num_layer, dff=None, experiment_id=None, optimizer="muon", notes=None, decay_steps=1200, mode="iter", time_budget_seconds=TIME_BUDGET_SECONDS, Tw_sec=None, decay_sec=None, vocab_path=None, merges_path=None, encoded_path=None, dataset_name=None):
+            self, input_path, d_model, batch_size, num_heads, max_seq, theta, lr_min, lr_max, Tw, Tc, lamda, device, dtype, vocab_size, num_layer, dff=None, experiment_id=None, optimizer="muon", notes=None, decay_steps=1200, mode="iter", time_budget_seconds=TIME_BUDGET_SECONDS, Tw_sec=None, decay_sec=None, vocab_path=None, merges_path=None, encoded_path=None, dataset_name=None, grad_accum_steps=1):
         if mode not in TRAIN_MODES:
             raise ValueError(f"mode must be one of {TRAIN_MODES}, got {mode!r}")
         self.experiment_id = experiment_id or default_experiment_id()
@@ -116,6 +118,7 @@ class LLM_train:
         self.encoded_path = encoded_path  # same role as out_bin
         self.d_model = d_model
         self.batch_size = batch_size
+        self.grad_accum_steps = grad_accum_steps
         self.num_heads = num_heads
         self.max_seq = max_seq
         self.theta = theta
@@ -197,6 +200,8 @@ class LLM_train:
             "lr_max": self.lr_max,
             "weight_decay": self.weight_decay,
             "batch_size": self.batch_size,
+            "grad_accum_steps": self.grad_accum_steps,
+            "effective_batch_size": self.batch_size * self.grad_accum_steps,
             "max_seq": self.max_seq,
             "d_model": self.d_model,
             "num_heads": self.num_heads,
@@ -305,25 +310,36 @@ class LLM_train:
 
             step_start = time.perf_counter()
             self.current_step = step
-            input_seq, target_label = run_get_batch(self.encoded_path, self.batch_size, self.max_seq, self.device)
-            B, T = input_seq.shape[0], input_seq.shape[1]
-
-            if self.mfu is not None:
-                self.mfu.record_start_fwd()
-            logits = self.transformer(input_seq)
-            loss = cross_entropy(logits, target_label)
-            if self.mfu is not None:
-                self.mfu.record_end_fwd()
-
+            
             for opt in self.optimizers:
                 opt.zero_grad()
-            loss.backward()
-            if self.mfu is not None:
-                self.mfu.record_end_bwd()
-                self.mfu.finish_step(B, T)
+                
+            #the following implements gradient accumulation to save VRAM 
+            accum_loss = 0.0
+            for micro_step in range(self.grad_accum_steps):
+                input_seq, target_label = run_get_batch(self.encoded_path, self.batch_size, self.max_seq, self.device)
+                B, T = input_seq.shape[0], input_seq.shape[1]
 
-            loss_set.append(loss.item())
+                if self.mfu is not None:
+                    self.mfu.record_start_fwd()
+                logits = self.transformer(input_seq)
+                loss = cross_entropy(logits, target_label)
+                loss = loss / self.grad_accum_steps
+                
+                if self.mfu is not None:
+                    self.mfu.record_end_fwd()
+                #accumulation of gradients is done here
+                loss.backward()
+                accum_loss += loss.item() * self.grad_accum_steps
+                
+                if self.mfu is not None:
+                    self.mfu.record_end_bwd()
+                    self.mfu.finish_step(B, T)
+
+            accum_loss /= self.grad_accum_steps
+            loss_set.append(accum_loss)
             gradient_clipping(self.transformer.parameters(), M=1)
+            #actual update happens here.
             for opt in self.optimizers:
                 opt.step()
             lr = self.optimizer_adamw.param_groups[0]["lr"]
@@ -331,8 +347,8 @@ class LLM_train:
             self.step_times.append(time.perf_counter() - step_start)
             stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             print(
-                f"[{stamp}] step={step} adamw_lr={lr:.6e}"
-                f"loss={loss.item():.4f}"
+                f"[{stamp}] step={step} adamw_lr={lr:.6e} "
+                f"loss={accum_loss:.4f}"
             )
             step += 1
         self.write_report()
@@ -413,19 +429,20 @@ def dry_run(steps: int = 2, optimizer="muon"):
 
 def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset="opentext"):
     paths = resolve_dataset(dataset)
-    print(f"dataset={paths['name']} input={paths['input_path'].name}")
+    print(f"dataset={paths['name']} input={paths['input_path'].name} vocab_size={paths['vocab_size']}")
 
     # --- tweak these for --mode time (seconds) --- !!!
     time_budget_seconds = TIME_BUDGET_SECONDS  # 45 min
     Tw_sec = 270.0       # warmup (~4.5 min)
     decay_sec = 540.0    # final cosine decay (~9 min)
-    
+    grad_accum_steps = 4  # micro-batches per optimizer step (effective batch = batch_size * this)
+
     training = LLM_train(
         input_path=paths["input_path"],
         d_model=1024,
-        batch_size=64,
+        batch_size=32,
         num_heads=16,
-        max_seq=256,
+        max_seq=1024,
         theta=10000,
         lr_min=8e-4,
         lr_max=8e-3,
@@ -435,7 +452,7 @@ def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset=
         lamda=0.1,
         device=device,
         dtype=dtype,
-        vocab_size=10000,
+        vocab_size=paths["vocab_size"],
         num_layer=4,
         experiment_id=experiment_id,
         optimizer=optimizer,
@@ -448,6 +465,7 @@ def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset=
         merges_path=paths["merges_path"],
         encoded_path=paths["out_bin"],
         dataset_name=paths["name"],
+        grad_accum_steps=grad_accum_steps,
     )
     transformer, lr_set, loss_set = training.forward()
     # Loss curve is already written by experiment_report; skip interactive
@@ -458,19 +476,19 @@ def text_generation(prompt=None, limit=256, p=0.91, dataset="opentext"):
     training = LLM_train(
         input_path=paths["input_path"],
         d_model=512,
-        batch_size=64,
+        batch_size=32,
         num_heads=16,
         max_seq=256,
         theta=10000,
-        lr_min=8e-4,
-        lr_max=8e-3,
+        lr_min=1.5e-4,
+        lr_max=1.5e-3,
         Tw=500,
         Tc=5000,
         lamda=0.1,
         device=device,
         dtype=dtype,
-        vocab_size=10000,
-        num_layer=4,
+        vocab_size=paths["vocab_size"],
+        num_layer=8,
         vocab_path=paths["vocab_path"],
         merges_path=paths["merges_path"],
         encoded_path=paths["out_bin"],

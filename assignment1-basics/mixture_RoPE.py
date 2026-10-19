@@ -21,7 +21,7 @@ def mixture_RoPE(q, k, v, rope, token_positions, mask, attention_fn=sdpa.scaled_
 
     # Key at position t uses features from t-1; position 0 has no predecessor.
     k_shift = torch.roll(k_raw, shifts=1, dims=-2)
-    k_shift[..., 0, :] = 0.0
+    k_shift[..., 0, :].zero_()
 
     rope_attn = attention_fn(q_rope, k_rope, v, mask)
     shift_attn = attention_fn(q_shift, k_shift, v, mask)

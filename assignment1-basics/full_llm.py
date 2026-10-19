@@ -1,5 +1,6 @@
 from RMSnorm import RMSnorm
 import torch
+from torch.utils.checkpoint import checkpoint
 from sublayer import Sublayer
 from embedding import Embedding
 from RotaryPositionalEmbedding import RotaryPositionalEmbedding
@@ -49,10 +50,11 @@ class Full_llm(torch.nn.Module):
 
 
     #note x here refers to encoded prompt.
+    #checkpoint is used to save memory. recomputation.
     def forward(self, x):
         x = self.embedding(x)
         for sublayer in self.layers:
-            x = sublayer(x)
+            x = checkpoint(sublayer, x, use_reentrant=False)
         final_x = self.Wrmf(x)
         logits = final_x @ self.Wlm.T
         return logits

@@ -26,7 +26,7 @@ class SGD(torch.optim.Optimizer):
                 grad = p.grad.data  # Get the gradient of loss with respect to p.
 
                 # Update weight tensor in-place with scheduled lr decayed by 1/sqrt(t+1)
-                p.data -= (lr / math.sqrt(t + 1)) * grad
+                p.data.add_(grad, alpha=-(lr / math.sqrt(t + 1)))
                 state["t"] = t + 1  # Increment iteration number.
 
         return loss

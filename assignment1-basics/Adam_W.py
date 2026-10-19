@@ -85,24 +85,18 @@ class Adam_W(torch.optim.Optimizer):
                 m = state["m"]
                 v = state["v"]
 
-                # Momentum updates in FP32
-                momentum = (beta1 * m) + ((1.0 - beta1) * grad)
-                momentum_p2 = (beta2 * v) + ((1.0 - beta2) * (grad**2))
+                # Momentum updates in FP32 (in-place into optimizer state buffers)
+                m.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
+                v.mul_(beta2).add_(grad * grad, alpha=(1.0 - beta2))
 
                 # Compute update unit
-                unit = momentum / (torch.sqrt(momentum_p2) + eps_hat)
+                unit = m / (torch.sqrt(v) + eps_hat)
 
-                # Decoupled weight decay + Adam update
-                p_fp32 = (
-                    p_fp32 - (lr * weight_decay * p_fp32) - (step_size * unit)
-                )
+                # Decoupled weight decay + Adam update (in-place on fp32 copy)
+                p_fp32.mul_(1.0 - lr * weight_decay).add_(unit, alpha=-step_size)
 
                 # Write downcasted parameters back to low precision (e.g., BF16)
                 p.data.copy_(p_fp32)
-
-                # Store FP32 momentum moments in parameter state
-                state["m"] = momentum
-                state["v"] = momentum_p2
 
         return loss
 

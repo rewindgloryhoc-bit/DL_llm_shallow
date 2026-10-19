@@ -17,9 +17,13 @@ def zeropower_via_newtonschulz5(G, steps: int):
     # Perform the NS iterations
     for _ in range(steps):
         A = X @ X.mT
-        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-    
+        AA = A @ A
+        # B = b * A + c * A @ A  (in-place into A)
+        A.mul_(b).add_(AA, alpha=c)
+        BX = A @ X
+        # X = a * X + B @ X
+        X.mul_(a).add_(BX)
+
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
@@ -32,7 +36,7 @@ def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
     if update.ndim == 4: # for the case of conv filters
         update = update.view(len(update), -1)
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-    update *= max(1, update.size(-2) / update.size(-1))**0.5
+    update.mul_(max(1, update.size(-2) / update.size(-1))**0.5)
     return update
 
 

@@ -75,28 +75,25 @@ class Adam_W(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 state = self.state[p]
-                p_fp32 = p.data.float()
-                grad = p.grad.data.float()
-
+                
+                # Momentum states stay in FP32
                 if "m" not in state:
-                    state["m"] = torch.zeros_like(p_fp32)
-                    state["v"] = torch.zeros_like(p_fp32)
+                    state["m"] = torch.zeros_like(p.data, dtype=torch.float32)
+                    state["v"] = torch.zeros_like(p.data, dtype=torch.float32)
 
                 m = state["m"]
                 v = state["v"]
+                grad_fp32 = p.grad.data.float()
 
                 # Momentum updates in FP32 (in-place into optimizer state buffers)
-                m.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
-                v.mul_(beta2).add_(grad * grad, alpha=(1.0 - beta2))
+                m.mul_(beta1).add_(grad_fp32, alpha=(1.0 - beta1))
+                v.mul_(beta2).add_(grad_fp32 * grad_fp32, alpha=(1.0 - beta2))
 
                 # Compute update unit
                 unit = m / (torch.sqrt(v) + eps_hat)
 
-                # Decoupled weight decay + Adam update (in-place on fp32 copy)
-                p_fp32.mul_(1.0 - lr * weight_decay).add_(unit, alpha=-step_size)
-
-                # Write downcasted parameters back to low precision (e.g., BF16)
-                p.data.copy_(p_fp32)
+                # Decoupled weight decay + Adam update (in-place on original parameter dtype)
+                p.data.mul_(1.0 - lr * weight_decay).add_(unit.to(p.dtype), alpha=-step_size)
 
         return loss
 

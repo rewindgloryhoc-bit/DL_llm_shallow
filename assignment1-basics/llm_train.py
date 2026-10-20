@@ -133,9 +133,10 @@ class LLM_train:
         self.vocab_size = vocab_size
         self.current_step = 0
         self.layers = num_layer
-        # Time-schedule knobs (seconds). If omitted, derive from Tw/Tc/decay_steps ratios.
-        self.Tw_sec = Tw_sec if Tw_sec is not None else (Tw / Tc) * time_budget_seconds
-        self.decay_sec = decay_sec if decay_sec is not None else (decay_steps / Tc) * time_budget_seconds
+        # Time mode: fixed-step warmup (Tw); decay is a fixed fraction of the budget.
+        # Tw_sec is unused for scheduling (kept only if an explicit override is passed).
+        self.Tw_sec = Tw_sec
+        self.decay_sec = decay_sec if decay_sec is not None else time_budget_seconds / 9.0
         if dff is None:
             self.d_ff = d_ff_from_d_model(self.d_model)
         else:
@@ -192,8 +193,12 @@ class LLM_train:
         sys.exit(0)
 
     def hyperparameters(self):
+        if self.mode == "iter":
+            schedule = "iteration-based (cos_annealing)"
+        else:
+            schedule = "hybrid (step warmup + time decay)"
         hp = {
-            "schedule": "iteration-based (cos_annealing)" if self.mode == "iter" else "time-based (cos_annealing_time)",
+            "schedule": schedule,
             "mode": self.mode,
             "optimizer": "AdamW only" if self.optimizer_name == "adamw" else "Muon (2D hidden) + AdamW (rest)",
             "lr_min": self.lr_min,
@@ -224,9 +229,9 @@ class LLM_train:
         else:
             hp["time_budget_seconds"] = self.time_budget_seconds
             hp["time_budget_minutes"] = self.time_budget_seconds / 60
-            hp["Tw_sec"] = self.Tw_sec
+            hp["Tw (warmup steps)"] = self.Tw
             hp["decay_sec"] = self.decay_sec
-            hp["Tw / Tc / decay_steps"] = "n/a (time mode)"
+            hp["decay_fraction_of_budget"] = self.decay_sec / self.time_budget_seconds
         return hp
 
     def write_report(self, interrupted=False):
@@ -272,11 +277,16 @@ class LLM_train:
         self.mfu = None
         if self.device.type == "cuda":
             self.mfu = FullStepMFUBenchmarker(
-                self.d_model, self.d_ff, self.layers, self.dtype
+                self.d_model,
+                self.d_ff,
+                self.layers,
+                self.dtype,
+                activation_checkpointing=True,  # projections and SwiGLU recomputed; attention map kept
             )
             print(
                 f"full-step MFU benchmark on (peak={self.mfu.peak_tflops:.0f} TFLOPS, "
-                "warmup=15, window=20); compatible with torch.compile"
+                "warmup=15, window=20, credits recompute of projections and SwiGLU); "
+                "compatible with torch.compile"
             )
 
         lr_set = self.lr_set
@@ -293,8 +303,9 @@ class LLM_train:
             print(f"device={self.device} compile={compile_backend}")
         if self.mode == "time":
             print(
-                f"time mode: budget={self.time_budget_seconds / 60:.0f} min, "
-                f"Tw_sec={self.Tw_sec:.1f}, decay_sec={self.decay_sec:.1f} (LR uses cos_annealing_time)"
+                f"time mode (hybrid LR): budget={self.time_budget_seconds / 60:.0f} min, "
+                f"Tw={self.Tw} steps (fixed), decay_sec={self.decay_sec:.1f} "
+                f"({self.decay_sec / 60:.1f} min = 1/9 of budget)"
             )
         else:
             print(f"iter mode: training from step {self.current_step} to {step_size - 1}")
@@ -307,6 +318,17 @@ class LLM_train:
                 elapsed = time.time() - self.train_start_time
                 print(f"time budget reached ({elapsed / 60:.1f} min); stopping at step {step}")
                 break
+
+            if self.mode == "time" and step == self.Tw:
+                elapsed = time.time() - self.train_start_time
+                time_left = max(0.0, self.time_budget_seconds - elapsed)
+                steady_sec = max(0.0, time_left - self.decay_sec)
+                print(
+                    f"warmup done at step {step} ({elapsed / 60:.2f} min elapsed); "
+                    f"time left={time_left / 60:.2f} min → "
+                    f"steady={steady_sec / 60:.2f} min @ lr_max, "
+                    f"decay={self.decay_sec / 60:.2f} min"
+                )
 
             step_start = time.perf_counter()
             self.current_step = step
@@ -322,18 +344,14 @@ class LLM_train:
 
                 if self.mfu is not None:
                     self.mfu.record_start_fwd()
-                logits = self.transformer(input_seq)
-                loss = cross_entropy(logits, target_label)
-                loss = loss / self.grad_accum_steps
+                    
+                # Full_llm handles the chunked loss internally now to save memory
+                loss_tensor = self.transformer(input_seq, targets=target_label, return_logits=False, grad_accum_steps=self.grad_accum_steps, mfu=self.mfu)
+                loss_val = loss_tensor.item() / self.grad_accum_steps
+                
+                accum_loss += loss_val * self.grad_accum_steps
                 
                 if self.mfu is not None:
-                    self.mfu.record_end_fwd()
-                #accumulation of gradients is done here
-                loss.backward()
-                accum_loss += loss.item() * self.grad_accum_steps
-                
-                if self.mfu is not None:
-                    self.mfu.record_end_bwd()
                     self.mfu.finish_step(B, T)
 
             accum_loss /= self.grad_accum_steps
@@ -401,13 +419,11 @@ def dry_run(steps: int = 2, optimizer="muon"):
     for step in range(steps):
         input_seq = torch.randint(0, vocab_size, (batch_size, max_seq), device=dry_device)
         target_label = torch.randint(0, vocab_size, (batch_size, max_seq), device=dry_device)
-        logits = model(input_seq)
-        assert logits.shape == (batch_size, max_seq, vocab_size), logits.shape
-        loss = cross_entropy(logits, target_label)
+        loss = model(input_seq, targets=target_label, return_logits=False)
         assert torch.isfinite(loss), f"non-finite loss at step {step}: {loss}"
         for opt in optimizers:
             opt.zero_grad()
-        loss.backward()
+        # loss.backward() is called internally now
         gradient_clipping(model.parameters(), M=1)
         for opt in optimizers:
             opt.step()
@@ -431,35 +447,36 @@ def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset=
     paths = resolve_dataset(dataset)
     print(f"dataset={paths['name']} input={paths['input_path'].name} vocab_size={paths['vocab_size']}")
 
-    # --- tweak these for --mode time (seconds) --- !!!
+    # --- schedule knobs ---
+    # Warmup is fixed in steps (independent of wall clock).
+    # In --mode time: decay uses 1/9 of the 45 min budget; the rest after warmup is lr_max hold.
     time_budget_seconds = TIME_BUDGET_SECONDS  # 45 min
-    Tw_sec = 270.0       # warmup (~4.5 min)
-    decay_sec = 540.0    # final cosine decay (~9 min)
-    grad_accum_steps = 4  # micro-batches per optimizer step (effective batch = batch_size * this)
+    Tw = 300
+    decay_sec = time_budget_seconds / 10.0  # 5 min final cosine decay
+    grad_accum_steps = 1  # micro-batches per optimizer step (effective batch = batch_size * this)
 
     training = LLM_train(
         input_path=paths["input_path"],
-        d_model=1024,
-        batch_size=32,
-        num_heads=16,
-        max_seq=1024,
+        d_model=768,
+        batch_size=256,
+        num_heads=12,
+        max_seq=512,
         theta=10000,
-        lr_min=8e-4,
-        lr_max=8e-3,
-        Tw=500,
+        lr_min=1.5e-4,
+        lr_max=1.5e-3,
+        Tw=Tw,
         Tc=5000,
         decay_steps=1000,
         lamda=0.1,
         device=device,
         dtype=dtype,
         vocab_size=paths["vocab_size"],
-        num_layer=4,
+        num_layer=8,
         experiment_id=experiment_id,
         optimizer=optimizer,
         notes=notes,
         mode=mode,
         time_budget_seconds=time_budget_seconds,
-        Tw_sec=Tw_sec,
         decay_sec=decay_sec,
         vocab_path=paths["vocab_path"],
         merges_path=paths["merges_path"],

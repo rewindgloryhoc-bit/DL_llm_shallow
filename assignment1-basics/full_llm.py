@@ -1,9 +1,9 @@
 from RMSnorm import RMSnorm
 import torch
-from torch.utils.checkpoint import checkpoint
 from sublayer import Sublayer
 from embedding import Embedding
 from RotaryPositionalEmbedding import RotaryPositionalEmbedding
+from mixture_RoPE import USE_MIXTURE_ROPE
 '''
     out = x + Multi-head_attention(RMSnorm(x)), with RoPE
     x ~ [batch sequence h_d]
@@ -23,8 +23,9 @@ class Full_llm(torch.nn.Module):
 
         self.embedding = Embedding(vocab_size, d_model, device=self.device, dtype=self.dtype)
 
-        # One RoPE cache shared by every layer (mixture attention rotates half of each head).
-        self.rope = RotaryPositionalEmbedding(self.theta, self.d_head // 2, self.max_seq_len, device=self.device)
+        # Shared RoPE cache: half-head for mixture, full head for standard RoPE.
+        rope_dim = self.d_head // 2 if USE_MIXTURE_ROPE else self.d_head
+        self.rope = RotaryPositionalEmbedding(self.theta, rope_dim, self.max_seq_len, device=self.device)
 
         self.layers = torch.nn.ModuleList([
             Sublayer(
@@ -44,17 +45,71 @@ class Full_llm(torch.nn.Module):
         # Final RMSNorm gain stays fp32 regardless of model dtype.
         self.Wrmf = RMSnorm(self.d_model, gi=None, eps=1e-5, device=self.device, dtype=torch.float32)
         # Shape matches adapters' lm_head.weight: (vocab_size, d_model)
-        Wf = torch.empty(vocab_size, self.d_model, dtype=self.dtype, device=self.device)
+        Wf = torch.empty(vocab_size, self.d_model, dtype=self.dtype)
         Wf = torch.nn.init.trunc_normal_(Wf)
+        Wf = Wf.to(self.device)
         self.Wlm = torch.nn.Parameter(Wf, requires_grad=True)
 
 
     #note x here refers to encoded prompt.
-    #checkpoint is used to save memory. recomputation.
-    def forward(self, x):
+    # Attention maps stay saved. Norms, QKV projections, and SwiGLU are recomputed.
+    def forward(self, x, targets=None, return_logits=True, grad_accum_steps=1, mfu=None):
+        self.mfu = mfu
         x = self.embedding(x)
         for sublayer in self.layers:
-            x = checkpoint(sublayer, x, use_reentrant=False)
+            x = sublayer(x)
         final_x = self.Wrmf(x)
+        
+        if targets is not None:
+            # We compute loss here to allow chunking and saving memory
+            from cross_entropy import cross_entropy
+            # If not chunking, we could just do it normally, but we implement chunking over batch dimension.
+            B, S, d_model = final_x.shape
+            chunk_size = 32 # number of batch rows per chunk (256/32 = 8 chunks). Adjust as needed to balance overhead/memory.
+            
+            total_loss = torch.zeros((), device=final_x.device, dtype=final_x.dtype)
+            
+            # we need to be careful with backwards. if we just backward the chunk loss, it'll walk the whole graph
+            # every chunk. so we detach final_x, do the backward on final_x chunks, then do one big backward
+            # on the original final_x using the accumulated gradients.
+            if final_x.requires_grad:
+                final_x_detached = final_x.detach().requires_grad_(True)
+            else:
+                final_x_detached = final_x
+            
+            for i in range(0, B, chunk_size):
+                x_chunk = final_x_detached[i:i+chunk_size]
+                target_chunk = targets[i:i+chunk_size]
+                
+                # Compute logits for just this chunk
+                logits_chunk = x_chunk @ self.Wlm.T
+                
+                # Compute loss for this chunk. cross_entropy handles the internal operations.
+                loss_chunk = cross_entropy(logits_chunk, target_chunk)
+                # scale chunk loss so the sum equals the mean over the whole batch
+                loss_chunk = loss_chunk * (x_chunk.shape[0] / B)
+                total_loss += loss_chunk.detach()
+                
+                if final_x.requires_grad:
+                    # Apply grad accum step scaling right here to the chunk loss
+                    scaled_loss_chunk = loss_chunk / grad_accum_steps
+                    scaled_loss_chunk.backward()
+            
+            if final_x.requires_grad:
+                if self.mfu is not None:
+                    # Signal that forward pass is done (transformer + chunked final logit/loss)
+                    self.mfu.record_end_fwd()
+                    
+                final_x.backward(final_x_detached.grad)
+                
+                if self.mfu is not None:
+                    # Signal that backward pass is done
+                    self.mfu.record_end_bwd()
+                    
+            total_loss.requires_grad_(True)
+            if return_logits:
+                return total_loss, None
+            return total_loss
+
         logits = final_x @ self.Wlm.T
         return logits

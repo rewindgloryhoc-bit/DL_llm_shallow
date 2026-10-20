@@ -16,6 +16,7 @@ def scaled_attention(query, keys, values, mask):
     attention_scaled = attention / math.sqrt(d_k)
     attention_masked = attention_scaled.masked_fill(~mask, float("-inf"))
     # Keep model dtype (bf16 on CUDA) — avoid materializing a full fp32 [B,H,S,S] map.
+    # This S^2 map is left in the autograd graph. It is bandwidth-bound, so it is not recomputed.
     normalized_attention = softmax(attention_masked, -1)
     attention_score = einops.einsum(
         normalized_attention, values, "batch ... q k, batch ... k dv -> batch ... q dv"

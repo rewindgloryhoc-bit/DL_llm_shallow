@@ -1,5 +1,6 @@
 import torch.nn as nn
 import torch
+from torch.utils.checkpoint import checkpoint
 from RotaryPositionalEmbedding import RotaryPositionalEmbedding as RoPE
 import mixture_RoPE as mr
 import scaled_dot_product_attention as sdpa
@@ -26,9 +27,10 @@ class MultiHeadSelfAttention(torch.nn.Module):
         self.theta = rope_theta
         self.max_seq = max_seq
         self.d_heads = self.d_model // self.num_heads
-        # RoPE only rotates the first half of each head; may be shared across layers.
+        # Mixture rotates half-head; standard RoPE rotates full head dim.
         if rope is None:
-            rope = RoPE(self.theta, self.d_heads // 2, self.max_seq, device=device)
+            rope_dim = self.d_heads // 2 if mr.USE_MIXTURE_ROPE else self.d_heads
+            rope = RoPE(self.theta, rope_dim, self.max_seq, device=device)
         self.RoPE = rope
         self.mask = mask
 
@@ -40,18 +42,35 @@ class MultiHeadSelfAttention(torch.nn.Module):
             self.mask = causal_mask
         seq_len = x.size(-2)
         mask = self.mask[:seq_len, :seq_len]
-        q = x @ self.Wq.T
-        k = x @ self.Wk.T
-        v = x @ self.Wv.T
-        query = torch.unflatten(q, dim=-1, sizes=[-1, self.d_heads]).transpose(-3, -2)
-        #[... heads, seq, d_heads]
-        key = torch.unflatten(k, dim=-1, sizes=[-1, self.d_heads]).transpose(-3, -2)
-        value = torch.unflatten(v, dim=-1, sizes=[-1, self.d_heads]).transpose(-3, -2)
+        query, key, value = self._project_qkv(x)
 
         if token_positions is None:
             token_positions = torch.arange(query.size(-2), device=x.device)
 
-        attention = mr.mixture_RoPE(query, key, value, self.RoPE, token_positions, mask, self.attention_fn)
-        projection = attention @ self.Wo.T
-        return projection
+        # Attention map stays saved. Projections are recomputed on backward.
+        rope_fn = mr.mixture_RoPE if mr.USE_MIXTURE_ROPE else mr.standard_RoPE
+        attention = rope_fn(query, key, value, self.RoPE, token_positions, mask, self.attention_fn)
+        return self._out_proj(attention)
+
+    def _project_qkv(self, x):
+        def project(x):
+            q = x @ self.Wq.T
+            k = x @ self.Wk.T
+            v = x @ self.Wv.T
+            query = torch.unflatten(q, dim=-1, sizes=[-1, self.d_heads]).transpose(-3, -2)
+            key = torch.unflatten(k, dim=-1, sizes=[-1, self.d_heads]).transpose(-3, -2)
+            value = torch.unflatten(v, dim=-1, sizes=[-1, self.d_heads]).transpose(-3, -2)
+            return query, key, value
+
+        if torch.is_grad_enabled() and x.requires_grad:
+            return checkpoint(project, x, use_reentrant=False)
+        return project(x)
+
+    def _out_proj(self, attention):
+        def project(attention):
+            return attention @ self.Wo.T
+
+        if torch.is_grad_enabled() and attention.requires_grad:
+            return checkpoint(project, attention, use_reentrant=False)
+        return project(attention)
 

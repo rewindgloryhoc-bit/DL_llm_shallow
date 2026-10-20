@@ -2,6 +2,17 @@ import torch
 import scaled_dot_product_attention as sdpa
 import einops
 
+# Temporary switch: False → standard full-head RoPE (single attn); True → mixture path.
+USE_MIXTURE_ROPE = False
+
+
+def standard_RoPE(q, k, v, rope, token_positions, mask, attention_fn=sdpa.scaled_attention):
+    """Standard RoPE: rotate full Q/K head dim, then one scaled attention."""
+    q = rope(q, token_positions)
+    k = rope(k, token_positions)
+    attention = attention_fn(q, k, v, mask)
+    return einops.rearrange(attention, "... head seq hd -> ... seq (head hd)")
+
 
 def mixture_RoPE(q, k, v, rope, token_positions, mask, attention_fn=sdpa.scaled_attention):
     """Mixture attention over head dim halves.

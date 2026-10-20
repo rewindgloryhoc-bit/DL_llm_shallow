@@ -23,7 +23,7 @@ def setup_optimizers(
 
     optimizer="muon":  2D hidden matrices -> Muon, everything else -> AdamW.
     optimizer="adamw": every parameter -> AdamW; optimizer_muon is None.
-    schedule_mode="time": LR from cos_annealing_time (needs Tw_sec, T_budget, decay_sec).
+    schedule_mode="time": hybrid LR — step warmup (Tw) + wall-clock decay (decay_sec of T_budget).
     """
     if optimizer not in OPTIMIZER_CHOICES:
         raise ValueError(f"setup_optimizers: optimizer must be one of {OPTIMIZER_CHOICES}, got {optimizer!r}")

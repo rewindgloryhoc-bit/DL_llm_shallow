@@ -22,12 +22,17 @@ class SwiGLU(torch.nn.Module):
         self.device = device
         self.dtype = dtype
         if w1 is None and w2 is None and w3 is None:
-            w1 = torch.empty(self.dff, self.d_model, device=self.device, dtype=self.dtype)
-            w2 = torch.empty(self.d_model, self.dff, device=self.device, dtype=self.dtype)
-            w3 = torch.empty(self.dff, self.d_model, device=self.device, dtype=self.dtype)
-            self.w1 = torch.nn.Parameter(torch.nn.init.trunc_normal_(w1))
-            self.w2 = torch.nn.Parameter(torch.nn.init.trunc_normal_(w2))
-            self.w3 = torch.nn.Parameter(torch.nn.init.trunc_normal_(w3))
+            w1 = torch.empty(self.dff, self.d_model, dtype=self.dtype)
+            w2 = torch.empty(self.d_model, self.dff, dtype=self.dtype)
+            w3 = torch.empty(self.dff, self.d_model, dtype=self.dtype)
+            
+            w1 = torch.nn.init.trunc_normal_(w1).to(self.device)
+            w2 = torch.nn.init.trunc_normal_(w2).to(self.device)
+            w3 = torch.nn.init.trunc_normal_(w3).to(self.device)
+
+            self.w1 = torch.nn.Parameter(w1)
+            self.w2 = torch.nn.Parameter(w2)
+            self.w3 = torch.nn.Parameter(w3)
         else:
             self.w1 = nn.Parameter(w1)
             self.w2 = nn.Parameter(w2)

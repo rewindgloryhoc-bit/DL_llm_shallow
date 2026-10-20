@@ -9,8 +9,9 @@ class Embedding(torch.nn.Module):
         self.device = device
         self.dtype = dtype
 
-        E =  torch.empty(vocab_size, d_model, device=self.device, dtype=self.dtype)
+        E =  torch.empty(vocab_size, d_model, dtype=self.dtype)
         E_tensor = torch.nn.init.trunc_normal_(E)
+        E_tensor = E_tensor.to(self.device)
         self.embedding = torch.nn.Parameter(E_tensor)
 
     def forward(self, token_ids:torch.Tensor):

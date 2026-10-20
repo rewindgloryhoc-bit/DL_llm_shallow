@@ -3,16 +3,18 @@ import torch
 from full_llm import Full_llm
 
 # --- mirrored from llm_train.main() / resolve_dataset("opentext") ---
-D_MODEL = 1024
-NUM_HEADS = 16
-NUM_LAYERS = 12
-MAX_SEQ = 1024
-BATCH_SIZE = 256
+D_MODEL = 768
+NUM_HEADS = 12
+NUM_LAYERS = 8
+MAX_SEQ = 512
+BATCH_SIZE = 128
 GRAD_ACCUM_STEPS = 1
 VOCAB_SIZE = 32000  # opentext
 THETA = 10000.0
 D_FF = int((8 / 3 * D_MODEL) // 128 * 128)  # same as llm_train.d_ff_from_d_model
 EFFECTIVE_BATCH = BATCH_SIZE * GRAD_ACCUM_STEPS
+# Hypothetical length of a training run until we wire real step counts.
+HYPOTHETICAL_TRAIN_STEPS = 9000
 
 
 # small helper function to calculate parameters given current llm architecture
@@ -43,8 +45,7 @@ def flops_attention(num_layers, seq_len, d_model, batch_size):
     return flops_attention_per_token(num_layers, seq_len, d_model) * num_tokens
 
 
-# Hypothetical length of a training run until we wire real step counts.
-HYPOTHETICAL_TRAIN_STEPS = 4000
+
 
 
 def flops_total_training(

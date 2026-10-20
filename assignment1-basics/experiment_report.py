@@ -53,6 +53,12 @@ def _append_mfu_section(lines, mfu_stats):
         f"- **Warmup steps discarded:** {mfu_stats['warmup_steps']}",
         f"- **Valid post-warmup steps:** {mfu_stats['valid_steps']}",
         f"- **Terminal print window:** {mfu_stats['window_size']} steps",
+        f"- **FLOP model:** {mfu_stats.get('flop_model', '3x_fwd_no_recompute')}"
+        + (
+            " (bwd window includes +1× forward recompute from activation checkpointing)"
+            if mfu_stats.get("activation_checkpointing")
+            else ""
+        ),
         "",
         "### Overall average (all valid steps)",
         "",

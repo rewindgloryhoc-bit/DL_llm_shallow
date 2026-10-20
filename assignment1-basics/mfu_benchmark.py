@@ -30,13 +30,27 @@ def flops_fwd_model(B, T, d_model, d_ff, num_layers) -> float:
     return num_layers * flops_fwd_layer(B, T, d_model, d_ff)
 
 
+def flops_train_phases(flops_fwd: float, activation_checkpointing: bool) -> tuple[float, float]:
+    """Return (flops_bwd_window, flops_full_step) for MFU numerators.
+
+    No checkpoint: bwd ≈ 2×fwd, step ≈ 3×fwd.
+    Per-layer activation checkpointing: backward also recomputes each block
+    forward, so bwd window ≈ 3×fwd (1× recompute + 2× bwd), step ≈ 4×fwd.
+    Timing already includes recompute inside loss.backward().
+    """
+    if activation_checkpointing:
+        return 3.0 * flops_fwd, 4.0 * flops_fwd
+    return 2.0 * flops_fwd, 3.0 * flops_fwd
+
+
 class FullStepMFUBenchmarker:
     """Outer-loop CUDA-event MFU tracker for one training step (fwd+loss / bwd)."""
 
-    def __init__(self, d_model, d_ff, num_layers, dtype):
+    def __init__(self, d_model, d_ff, num_layers, dtype, activation_checkpointing=True):
         self.d_model = d_model
         self.d_ff = d_ff
         self.num_layers = num_layers
+        self.activation_checkpointing = activation_checkpointing
         self.peak_tflops = peak_tflops_for_dtype(dtype)
         self.enabled = torch.cuda.is_available()
 
@@ -96,8 +110,7 @@ class FullStepMFUBenchmarker:
             return
 
         flops_fwd = flops_fwd_model(B, T, self.d_model, self.d_ff, self.num_layers)
-        flops_bwd = 2.0 * flops_fwd
-        flops_step = 3.0 * flops_fwd
+        flops_bwd, flops_step = flops_train_phases(flops_fwd, self.activation_checkpointing)
 
         tflops_fwd = flops_fwd / (time_fwd_ms * 1e9) if time_fwd_ms > 0 else 0.0
         tflops_bwd = flops_bwd / (time_bwd_ms * 1e9) if time_bwd_ms > 0 else 0.0
@@ -119,15 +132,23 @@ class FullStepMFUBenchmarker:
 
         if len(self._buffer) >= SUMMARY_WINDOW:
             window = self._window_average(self._buffer)
+            total = len(self._all_steps)
+            lo = total - len(self._buffer) + 1
+            hi = total
             self._window_avgs.append(window)
-            self._print_window_summary(window)
+            self._print_window_summary(window, lo, hi, total)
             self._buffer.clear()
 
-    def _print_window_summary(self, window):
+    def _print_window_summary(self, window, lo, hi, total):
+        flop_note = (
+            "bwd=3x fwd (recompute+bwd), step=4x fwd"
+            if self.activation_checkpointing
+            else "bwd=2x fwd, step=3x fwd"
+        )
         print(
             "===================================================\n"
-            f"[Full-Step MFU Summary | {window['n']} steps after warmup "
-            f"(peak={self.peak_tflops:.0f} TFLOPS)]\n"
+            f"[Full-Step MFU Summary | post-warmup steps {lo}-{hi} "
+            f"(total {total}; peak={self.peak_tflops:.0f} TFLOPS; {flop_note})]\n"
             f"{'phase':<10} {'latency_ms':>12} {'TFLOPS':>10} {'MFU%':>8}\n"
             f"{'Forward':<10} {window['fwd_ms']:>12.3f} {window['fwd_tflops']:>10.2f} {window['fwd_mfu']:>7.2f}%\n"
             f"{'Backward':<10} {window['bwd_ms']:>12.3f} {window['bwd_tflops']:>10.2f} {window['bwd_mfu']:>7.2f}%\n"
@@ -148,6 +169,12 @@ class FullStepMFUBenchmarker:
             "warmup_steps": WARMUP_STEPS,
             "window_size": SUMMARY_WINDOW,
             "valid_steps": len(self._all_steps),
+            "activation_checkpointing": self.activation_checkpointing,
+            "flop_model": (
+                "4x_fwd_with_recompute"
+                if self.activation_checkpointing
+                else "3x_fwd_no_recompute"
+            ),
             "overall": self._window_average(self._all_steps),
             "windows": windows,
         }

@@ -17,6 +17,7 @@ tokenized_prompt = BASE_DIR / "token_data" / f'prompt_at_{formatted_time}'
 
 # Reuse memmaps across microbatches; opening / remapping every call is wasteful.
 _MEMMAP_CACHE: dict[str, np.memmap] = {}
+_PINNED_BATCH_CACHE = {}
 
 
 #check if the file is a pickle file, for future use.
@@ -66,19 +67,30 @@ def run_get_batch(
     max_idx = seq_len - context_length - 1
     starts = np.random.randint(0, max_idx + 1, size=batch_size)
 
-    # Contiguous slices per row (memmap-friendly); avoid Python list + np.array copy chain.
-    x_np = np.empty((batch_size, context_length), dtype=np.int64)
-    y_np = np.empty((batch_size, context_length), dtype=np.int64)
-    for i, k in enumerate(starts):
-        x_np[i] = raw_data[k : k + context_length]
-        y_np[i] = raw_data[k + 1 : k + 1 + context_length]
+    #allocate memory for the batch on cpu directly instead of using numpy empty arrays.
+    cache_key = (batch_size, context_length)
+    if cache_key not in _PINNED_BATCH_CACHE:
+        batch_x = torch.empty((batch_size, context_length), dtype=torch.long)
+        batch_y = torch.empty((batch_size, context_length), dtype=torch.long)
+        torch_device = torch.device(device) if not isinstance(device, torch.device) else device
+        if torch_device.type == "cuda":
+            batch_x = batch_x.pin_memory()
+            batch_y = batch_y.pin_memory()
+        _PINNED_BATCH_CACHE[cache_key] = (batch_x, batch_y)
 
-    # Embedding / gather need integer index dtypes; uint16 from memmap is not allowed.
+    batch_x, batch_y = _PINNED_BATCH_CACHE[cache_key]
+
+    #in place copy of the data to the batch.(memmap -> torch tensor)
+    for i, k in enumerate(starts):
+        batch_x[i].copy_(torch.from_numpy(raw_data[k : k + context_length].astype(np.int64)))
+        batch_y[i].copy_(torch.from_numpy(raw_data[k + 1 : k + 1 + context_length].astype(np.int64)))
+
     torch_device = torch.device(device) if not isinstance(device, torch.device) else device
     if torch_device.type == "cuda":
-        x = torch.from_numpy(x_np).pin_memory().to(torch_device, non_blocking=True)
-        y = torch.from_numpy(y_np).pin_memory().to(torch_device, non_blocking=True)
+        x = batch_x.to(torch_device, non_blocking=True)
+        y = batch_y.to(torch_device, non_blocking=True)
     else:
-        x = torch.from_numpy(x_np).to(torch_device)
-        y = torch.from_numpy(y_np).to(torch_device)
+        x = batch_x.to(torch_device)
+        y = batch_y.to(torch_device)
+        
     return x, y

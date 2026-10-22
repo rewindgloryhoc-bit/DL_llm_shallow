@@ -38,16 +38,15 @@ class Full_llm(torch.nn.Module):
                 rope=self.rope,
                 device=self.device,
                 dtype=self.dtype,
+                num_layers=num_layers,
             )
             for _ in range(num_layers)
         ])
 
         # Final RMSNorm gain stays fp32 regardless of model dtype.
         self.Wrmf = RMSnorm(self.d_model, gi=None, eps=1e-5, device=self.device, dtype=torch.float32)
-        # Shape matches adapters' lm_head.weight: (vocab_size, d_model)
-        Wf = torch.empty(vocab_size, self.d_model, dtype=self.dtype)
-        Wf = torch.nn.init.trunc_normal_(Wf)
-        Wf = Wf.to(self.device)
+        # Zero head: logits start at 0, so the first loss is ln(vocab_size).
+        Wf = torch.zeros(vocab_size, self.d_model, dtype=self.dtype, device=self.device)
         self.Wlm = torch.nn.Parameter(Wf, requires_grad=True)
 
 

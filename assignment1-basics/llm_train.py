@@ -451,7 +451,7 @@ def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset=
     # Warmup is fixed in steps (independent of wall clock).
     # In --mode time: decay uses 1/9 of the 45 min budget; the rest after warmup is lr_max hold.
     time_budget_seconds = TIME_BUDGET_SECONDS  # 45 min
-    Tw = 300
+    Tw = 500
     decay_sec = time_budget_seconds / 10.0  # 5 min final cosine decay
     grad_accum_steps = 1  # micro-batches per optimizer step (effective batch = batch_size * this)
 

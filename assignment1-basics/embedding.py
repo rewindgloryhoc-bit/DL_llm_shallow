@@ -9,8 +9,9 @@ class Embedding(torch.nn.Module):
         self.device = device
         self.dtype = dtype
 
-        E =  torch.empty(vocab_size, d_model, dtype=self.dtype)
-        E_tensor = torch.nn.init.trunc_normal_(E)
+        # Lookup rows should have variance ~1. trunc_normal_ defaults to std=1, bounds ±2.
+        E = torch.empty(vocab_size, d_model, dtype=self.dtype)
+        E_tensor = torch.nn.init.trunc_normal_(E, mean=0.0, std=1.0, a=-3.0, b=3.0)
         E_tensor = E_tensor.to(self.device)
         self.embedding = torch.nn.Parameter(E_tensor)
 

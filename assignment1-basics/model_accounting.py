@@ -3,11 +3,11 @@ import torch
 from full_llm import Full_llm
 
 # --- mirrored from llm_train.main() / resolve_dataset("opentext") ---
-D_MODEL = 768
-NUM_HEADS = 12
-NUM_LAYERS = 8
+D_MODEL = 1024
+NUM_HEADS = 16
+NUM_LAYERS = 10
 MAX_SEQ = 512
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 GRAD_ACCUM_STEPS = 1
 VOCAB_SIZE = 32000  # opentext
 THETA = 10000.0
@@ -46,8 +46,6 @@ def flops_attention(num_layers, seq_len, d_model, batch_size):
 
 
 
-
-
 def flops_total_training(
     model,
     batch_size,
@@ -62,13 +60,58 @@ def flops_total_training(
     return flops_per_step * num_steps
 
 
-# Scaling-law fit for compute-optimal training tokens: N*(C) = A * C^α
+# Llama 3 scaling-law fit for compute-optimal training tokens: N*(C) = A * C^α
 SCALING_A = 0.29
 SCALING_ALPHA = 0.53
-def optimal_training_tokens(compute_flops, A=SCALING_A, alpha=SCALING_ALPHA):
+def Llama_3_optimal_training_tokens(compute_flops, A=SCALING_A, alpha=SCALING_ALPHA):
     if compute_flops <= 0:
         raise ValueError(f"compute_flops must be positive, got {compute_flops}")
     return A * (compute_flops ** alpha)
+
+
+# Chinchilla parametric scaling-law fit (Hoffmann et al., 2022):
+#   N_opt(C) = G * (C / 6)^a
+#   D_opt(C) = G^(-1) * (C / 6)^b
+# where G = ((alpha * A) / (beta * B))^(1 / (alpha + beta)),
+#       a = beta / (alpha + beta), b = alpha / (alpha + beta).
+CHINCHILLA_A = 406.4
+CHINCHILLA_B = 410.7
+CHINCHILLA_ALPHA = 0.4
+CHINCHILLA_BETA = 0.28
+CHINCHILLA_EXP_A = 0.46
+CHINCHILLA_EXP_B = 0.54
+
+
+def chinchilla_G(A=CHINCHILLA_A, B=CHINCHILLA_B, alpha=CHINCHILLA_ALPHA, beta=CHINCHILLA_BETA):
+    return ((alpha * A) / (beta * B)) ** (1.0 / (alpha + beta))
+
+
+def chinchilla_optimal_parameters(
+    compute_flops,
+    A=CHINCHILLA_A,
+    B=CHINCHILLA_B,
+    alpha=CHINCHILLA_ALPHA,
+    beta=CHINCHILLA_BETA,
+    a=CHINCHILLA_EXP_A,
+):
+    if compute_flops <= 0:
+        raise ValueError(f"compute_flops must be positive, got {compute_flops}")
+    G = chinchilla_G(A=A, B=B, alpha=alpha, beta=beta)
+    return G * ((compute_flops / 6.0) ** a)
+
+
+def chinchillaoptimal_training_tokens(
+    compute_flops,
+    A=CHINCHILLA_A,
+    B=CHINCHILLA_B,
+    alpha=CHINCHILLA_ALPHA,
+    beta=CHINCHILLA_BETA,
+    b=CHINCHILLA_EXP_B,
+):
+    if compute_flops <= 0:
+        raise ValueError(f"compute_flops must be positive, got {compute_flops}")
+    G = chinchilla_G(A=A, B=B, alpha=alpha, beta=beta)
+    return (G ** -1) * ((compute_flops / 6.0) ** b)
 
 
 def actual_training_tokens(batch_size, seq_len, num_steps=HYPOTHETICAL_TRAIN_STEPS):
@@ -133,7 +176,9 @@ def report_current_setup(num_steps=HYPOTHETICAL_TRAIN_STEPS):
         model, EFFECTIVE_BATCH, MAX_SEQ, NUM_LAYERS, D_MODEL, num_steps=num_steps
     )
     tokens_actual = actual_training_tokens(EFFECTIVE_BATCH, MAX_SEQ, num_steps=num_steps)
-    tokens_opt = optimal_training_tokens(flops_run)
+    llama3_tokens_opt = Llama_3_optimal_training_tokens(flops_run)
+    chinchilla_tokens_opt = chinchillaoptimal_training_tokens(flops_run)
+    chinchilla_params_opt = chinchilla_optimal_parameters(flops_run)
     vram_stats = analyze_vram_with_checkpointing(model, BATCH_SIZE, MAX_SEQ, NUM_LAYERS, D_MODEL, D_FF, NUM_HEADS)
 
     print("config (from llm_train.main):")
@@ -149,7 +194,9 @@ def report_current_setup(num_steps=HYPOTHETICAL_TRAIN_STEPS):
     print(f"FLOPs / step:                {flops_step:.6e}")
     print(f"FLOPs total ({num_steps} steps): {flops_run:.6e}")
     print(f"actual training tokens:      {tokens_actual:,}")
-    print(f"optimal training tokens:     {tokens_opt:.6e}")
+    print(f"optimal model parameters:    {chinchilla_params_opt:,.0f} ({chinchilla_params_opt:.6e})")
+    print(f"chinchilla optimal tokens:   {chinchilla_tokens_opt:,.0f} ({chinchilla_tokens_opt:.6e})")
+    print(f"llama3 optimal tokens:       {llama3_tokens_opt:,.0f} ({llama3_tokens_opt:.6e})")
     
     print("\n== Peak VRAM Estimation (with Checkpointing) ==")
     print(f"Model Parameters (bf16):     {vram_stats['bytes_params'] / 1024**3:5.2f} GB")
@@ -167,7 +214,9 @@ def report_current_setup(num_steps=HYPOTHETICAL_TRAIN_STEPS):
         "flops_per_step": flops_step,
         "flops_total_training": flops_run,
         "actual_training_tokens": tokens_actual,
-        "optimal_training_tokens": tokens_opt,
+        "optimal_model_parameters": chinchilla_params_opt,
+        "chinchilla_optimal_training_tokens": chinchilla_tokens_opt,
+        "llama3_optimal_training_tokens": llama3_tokens_opt,
         "vram_stats": vram_stats,
     }
 

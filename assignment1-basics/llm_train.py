@@ -369,6 +369,8 @@ class LLM_train:
                 f"loss={accum_loss:.4f}"
             )
             step += 1
+        self.save_checkpoint()
+        print(f"checkpoint saved to {checkpoint_path}")
         self.write_report()
         return self.transformer, lr_set, loss_set
 
@@ -452,14 +454,14 @@ def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset=
     # In --mode time: decay uses 1/9 of the 45 min budget; the rest after warmup is lr_max hold.
     time_budget_seconds = TIME_BUDGET_SECONDS  # 45 min
     Tw = 500
-    decay_sec = time_budget_seconds / 10.0  # 5 min final cosine decay
+    decay_sec = time_budget_seconds / 9.0  # 5 min final cosine decay
     grad_accum_steps = 1  # micro-batches per optimizer step (effective batch = batch_size * this)
 
     training = LLM_train(
         input_path=paths["input_path"],
-        d_model=768,
+        d_model=1024,
         batch_size=256,
-        num_heads=12,
+        num_heads=16,
         max_seq=512,
         theta=10000,
         lr_min=1.5e-4,
@@ -471,7 +473,7 @@ def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset=
         device=device,
         dtype=dtype,
         vocab_size=paths["vocab_size"],
-        num_layer=8,
+        num_layer=10,
         experiment_id=experiment_id,
         optimizer=optimizer,
         notes=notes,

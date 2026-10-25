@@ -64,7 +64,7 @@ class Full_llm(torch.nn.Module):
             from cross_entropy import cross_entropy
             # If not chunking, we could just do it normally, but we implement chunking over batch dimension.
             B, S, d_model = final_x.shape
-            chunk_size = 32 # number of batch rows per chunk (256/32 = 8 chunks). Adjust as needed to balance overhead/memory.
+            chunk_size = 128 # number of batch rows per chunk (256/32 = 8 chunks). Adjust as needed to balance overhead/memory.
             
             total_loss = torch.zeros((), device=final_x.device, dtype=final_x.dtype)
             
@@ -105,7 +105,10 @@ class Full_llm(torch.nn.Module):
                     # Signal that backward pass is done
                     self.mfu.record_end_bwd()
                     
-            total_loss.requires_grad_(True)
+            # Training reads this as a grad-bearing scalar. Eval uses inference_mode,
+            # where requires_grad_ is illegal, and never backprops through the loss.
+            if torch.is_grad_enabled():
+                total_loss.requires_grad_(True)
             if return_logits:
                 return total_loss, None
             return total_loss

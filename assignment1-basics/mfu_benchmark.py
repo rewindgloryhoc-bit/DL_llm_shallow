@@ -9,16 +9,35 @@ import statistics
 
 import torch
 
-PEAK_TFLOPS_BF16 = 989.0
-PEAK_TFLOPS_TF32 = 494.0
+# Dense tensor-core peaks. PyTorch matmuls do not use 2:4 sparsity,
+# so the sparse numbers (H100 1979, B200 4500) are not the denominator.
+PEAK_TFLOPS = {
+    "H100": {"bf16": 989.0, "tf32": 494.0},
+    "B200": {"bf16": 2250.0, "tf32": 1100.0},
+}
+PEAK_TFLOPS_BF16 = PEAK_TFLOPS["H100"]["bf16"]
+PEAK_TFLOPS_TF32 = PEAK_TFLOPS["H100"]["tf32"]
 WARMUP_STEPS = 15
 SUMMARY_WINDOW = 20
 
 
-def peak_tflops_for_dtype(dtype) -> float:
+def gpu_family(device_name: str | None = None) -> str:
+    """Map a CUDA device name to a peak-FLOP entry. Unknown GPUs use the H100 row."""
+    if device_name is None:
+        if not torch.cuda.is_available():
+            return "H100"
+        device_name = torch.cuda.get_device_name()
+    name = device_name.upper()
+    if "B200" in name:
+        return "B200"
+    return "H100"
+
+
+def peak_tflops_for_dtype(dtype, device_name: str | None = None) -> float:
+    peaks = PEAK_TFLOPS[gpu_family(device_name)]
     if dtype in (torch.bfloat16, torch.float16):
-        return PEAK_TFLOPS_BF16
-    return PEAK_TFLOPS_TF32
+        return peaks["bf16"]
+    return peaks["tf32"]
 
 
 def flops_fwd_layer(B, T, d_model, d_ff) -> float:
@@ -51,8 +70,9 @@ class FullStepMFUBenchmarker:
         self.d_ff = d_ff
         self.num_layers = num_layers
         self.activation_checkpointing = activation_checkpointing
-        self.peak_tflops = peak_tflops_for_dtype(dtype)
         self.enabled = torch.cuda.is_available()
+        self.gpu_name = torch.cuda.get_device_name() if self.enabled else "cpu"
+        self.peak_tflops = peak_tflops_for_dtype(dtype, self.gpu_name)
 
         self._start_fwd = None
         self._end_fwd = None
@@ -148,7 +168,7 @@ class FullStepMFUBenchmarker:
         print(
             "===================================================\n"
             f"[Full-Step MFU Summary | post-warmup steps {lo}-{hi} "
-            f"(total {total}; peak={self.peak_tflops:.0f} TFLOPS; {flop_note})]\n"
+            f"(total {total}; {gpu_family(self.gpu_name)} peak={self.peak_tflops:.0f} TFLOPS; {flop_note})]\n"
             f"{'phase':<10} {'latency_ms':>12} {'TFLOPS':>10} {'MFU%':>8}\n"
             f"{'Forward':<10} {window['fwd_ms']:>12.3f} {window['fwd_tflops']:>10.2f} {window['fwd_mfu']:>7.2f}%\n"
             f"{'Backward':<10} {window['bwd_ms']:>12.3f} {window['bwd_tflops']:>10.2f} {window['bwd_mfu']:>7.2f}%\n"

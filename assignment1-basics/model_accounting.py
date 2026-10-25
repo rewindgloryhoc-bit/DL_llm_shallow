@@ -5,7 +5,7 @@ from full_llm import Full_llm
 # --- mirrored from llm_train.main() / resolve_dataset("opentext") ---
 D_MODEL = 1024
 NUM_HEADS = 16
-NUM_LAYERS = 10
+NUM_LAYERS = 12
 MAX_SEQ = 512
 BATCH_SIZE = 256
 GRAD_ACCUM_STEPS = 1

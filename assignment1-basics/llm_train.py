@@ -7,6 +7,7 @@ import torch
 from cross_entropy import cross_entropy
 from gradient_clipping import gradient_clipping
 from check_point import save_checkpoint, load_checkpoint
+import gc
 import signal
 import sys
 from softmax import softmax
@@ -74,6 +75,9 @@ def resolve_dataset(name):
 step_size = 5000
 TIME_BUDGET_SECONDS = 45 * 60
 TRAIN_MODES = ("iter", "time")
+EVAL_INTERVAL = 200      # optimizer steps between quick validation passes
+EVAL_BATCHES = 20        # batches per quick validation pass
+EVAL_BATCH_SIZE = 32     # sequences per validation batch (20 * 32 = 640 fixed sequences)
 
 
 def pick_device():
@@ -103,7 +107,7 @@ def d_ff_from_d_model(d_model):
 
 class LLM_train:
     def __init__(
-            self, input_path, d_model, batch_size, num_heads, max_seq, theta, lr_min, lr_max, Tw, Tc, lamda, device, dtype, vocab_size, num_layer, dff=None, experiment_id=None, optimizer="muon", notes=None, decay_steps=1200, mode="iter", time_budget_seconds=TIME_BUDGET_SECONDS, Tw_sec=None, decay_sec=None, vocab_path=None, merges_path=None, encoded_path=None, dataset_name=None, grad_accum_steps=1):
+            self, input_path, d_model, batch_size, num_heads, max_seq, theta, lr_min, lr_max, Tw, Tc, lamda, device, dtype, vocab_size, num_layer, dff=None, experiment_id=None, optimizer="muon", notes=None, decay_steps=1200, mode="iter", time_budget_seconds=TIME_BUDGET_SECONDS, Tw_sec=None, decay_sec=None, vocab_path=None, merges_path=None, encoded_path=None, dataset_name=None, grad_accum_steps=1, valid=False):
         if mode not in TRAIN_MODES:
             raise ValueError(f"mode must be one of {TRAIN_MODES}, got {mode!r}")
         self.experiment_id = experiment_id or default_experiment_id()
@@ -180,6 +184,11 @@ class LLM_train:
         self.loss_set = []
         self.lr_set = []
         self.mfu = None
+        self.valid = valid
+        self.val_points = []  # (step, loss) from quick validation passes
+        self.eval_seconds = 0.0  # wall-clock spent in validation, excluded from the budget
+        self.val_x = None
+        self.val_y = None
         #directs to save checkpoint
         signal.signal(signal.SIGINT, self._handle_signal)
 
@@ -232,6 +241,12 @@ class LLM_train:
             hp["Tw (warmup steps)"] = self.Tw
             hp["decay_sec"] = self.decay_sec
             hp["decay_fraction_of_budget"] = self.decay_sec / self.time_budget_seconds
+        if self.valid:
+            hp["validation"] = (
+                f"every {EVAL_INTERVAL} steps on {EVAL_BATCHES} x {EVAL_BATCH_SIZE} fixed sequences"
+            )
+        else:
+            hp["validation"] = "off"
         return hp
 
     def write_report(self, interrupted=False):
@@ -247,6 +262,8 @@ class LLM_train:
             interrupted=interrupted,
             notes=self.notes,
             mfu_stats=mfu_stats,
+            val_points=self.val_points,
+            eval_seconds=self.eval_seconds,
         )
         print(f"experiment report written to {report_path}")
 
@@ -262,9 +279,45 @@ class LLM_train:
         start_step = load_checkpoint(checkpoint_path, self.transformer, self.optimizers)
         return start_step
 
+    # Wall-clock training time with validation pauses removed.
+    def train_elapsed(self):
+        return time.time() - self.train_start_time - self.eval_seconds
+
+    # Encode owt_valid.txt and keep a fixed validation subset on the device.
+    def prepare_validation(self):
+        from eval_val_loss import (
+            ENCODED_PATH, MERGES_PATH, VALID_PATH, VOCAB_PATH, encode_validation, load_fixed_subset,
+        )
+        encode_validation(VALID_PATH, ENCODED_PATH, VOCAB_PATH, MERGES_PATH)
+        self.val_x, self.val_y = load_fixed_subset(
+            ENCODED_PATH, EVAL_BATCHES * EVAL_BATCH_SIZE, self.max_seq, self.device
+        )
+        print(f"validation subset ready: {self.val_x.shape[0]} sequences x {self.max_seq} tokens")
+
+    # Quick validation pass. Its duration is removed from the budget and the LR clock.
+    def run_validation(self, step):
+        from eval_val_loss import quick_eval
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        t0 = time.time()
+        # Eager module shares weights with the compiled one and avoids recompiling it.
+        eager = self.transformer._orig_mod if hasattr(self.transformer, "_orig_mod") else self.transformer
+        val_loss = quick_eval(eager, self.val_x, self.val_y, EVAL_BATCH_SIZE)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        dt = time.time() - t0
+        self.eval_seconds += dt
+        for opt in self.optimizers:
+            for group in opt.param_groups:
+                group["train_start_time"] += dt
+        self.val_points.append((step, val_loss))
+        print(f"[validation] step={step} val_loss={val_loss:.4f} ({dt:.1f}s, not counted)")
+
     def forward(self):
         self.encoder.encode(self.input_path, self.encoded_path)
         print("encoding complete")
+        if self.valid:
+            self.prepare_validation()
 
         if Path(checkpoint_path).is_file():
             self.current_step = self.load_checkpoint()
@@ -314,13 +367,17 @@ class LLM_train:
         while True:
             if self.mode == "iter" and step >= step_size:
                 break
-            if self.mode == "time" and (time.time() - self.train_start_time) >= self.time_budget_seconds:
-                elapsed = time.time() - self.train_start_time
-                print(f"time budget reached ({elapsed / 60:.1f} min); stopping at step {step}")
+            
+            if self.mode == "time" and self.train_elapsed() >= self.time_budget_seconds:
+                elapsed = self.train_elapsed()
+                print(
+                    f"time budget reached ({elapsed / 60:.1f} min training, "
+                    f"{self.eval_seconds / 60:.1f} min validation excluded); stopping at step {step}"
+                )
                 break
 
             if self.mode == "time" and step == self.Tw:
-                elapsed = time.time() - self.train_start_time
+                elapsed = self.train_elapsed()
                 time_left = max(0.0, self.time_budget_seconds - elapsed)
                 steady_sec = max(0.0, time_left - self.decay_sec)
                 print(
@@ -369,6 +426,10 @@ class LLM_train:
                 f"loss={accum_loss:.4f}"
             )
             step += 1
+            if self.valid and step % EVAL_INTERVAL == 0:
+                self.run_validation(step - 1)
+        if self.valid and (not self.val_points or self.val_points[-1][0] != step - 1) and step > self.start_step:
+            self.run_validation(step - 1)
         self.save_checkpoint()
         print(f"checkpoint saved to {checkpoint_path}")
         self.write_report()
@@ -445,7 +506,10 @@ def dry_run(steps: int = 2, optimizer="muon"):
     print("dry-run passed")
 
 
-def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset="opentext"):
+def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset="opentext",
+         valid=False, final_eval=False):
+    if (valid or final_eval) and dataset != "opentext":
+        raise ValueError("validation uses owt_valid.txt, so it requires --train opentext")
     paths = resolve_dataset(dataset)
     print(f"dataset={paths['name']} input={paths['input_path'].name} vocab_size={paths['vocab_size']}")
 
@@ -454,7 +518,7 @@ def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset=
     # In --mode time: decay uses 1/9 of the 45 min budget; the rest after warmup is lr_max hold.
     time_budget_seconds = TIME_BUDGET_SECONDS  # 45 min
     Tw = 500
-    decay_sec = time_budget_seconds / 9.0  # 5 min final cosine decay
+    decay_sec = time_budget_seconds / 5.0 
     grad_accum_steps = 1  # micro-batches per optimizer step (effective batch = batch_size * this)
 
     training = LLM_train(
@@ -473,7 +537,7 @@ def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset=
         device=device,
         dtype=dtype,
         vocab_size=paths["vocab_size"],
-        num_layer=10,
+        num_layer=12,
         experiment_id=experiment_id,
         optimizer=optimizer,
         notes=notes,
@@ -485,8 +549,21 @@ def main(experiment_id=None, optimizer="muon", notes=None, mode="iter", dataset=
         encoded_path=paths["out_bin"],
         dataset_name=paths["name"],
         grad_accum_steps=grad_accum_steps,
+        valid=valid,
     )
     transformer, lr_set, loss_set = training.forward()
+    if final_eval:
+        from eval_val_loss import run_full_eval
+        num_heads, max_seq, theta = training.num_heads, training.max_seq, training.theta
+        # Free the training model and optimizer state before loading the checkpoint again.
+        # The SIGINT handler is a bound method, so it would keep `training` alive.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        del transformer, training
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("final validation on the full owt_valid.txt from the saved checkpoint")
+        run_full_eval(num_heads=num_heads, max_seq=max_seq, theta=theta)
     # Loss curve is already written by experiment_report; skip interactive
     # plt.show() so headless cloud GPUs do not hang waiting for a display.
 
@@ -531,6 +608,10 @@ if __name__ == "__main__":
                         help="iter: stop after a fixed step count; time: stop after a wall-clock budget")
     parser.add_argument("--train", choices=DATASET_CHOICES, default="opentext",
                         help="tinystories or opentext: selects input, vocab, merges, and encoded paths")
+    parser.add_argument("--valid", choices=("true", "false"), default=None,
+                        help=f"true: quick validation every {EVAL_INTERVAL} steps (time excluded from the budget)")
+    parser.add_argument("--final-eval", action="store_true",
+                        help="after training, score the full owt_valid.txt from the saved checkpoint")
     args = parser.parse_args()
     notes = " ".join(args.notes) if args.notes else None
 
@@ -540,4 +621,5 @@ if __name__ == "__main__":
         text_generation(dataset=args.train)
     else:
         experiment_id = sanitize_experiment_id(args.experiment) if args.experiment else None
-        main(experiment_id, optimizer=args.optimizer, notes=notes, mode=args.mode, dataset=args.train)
+        main(experiment_id, optimizer=args.optimizer, notes=notes, mode=args.mode, dataset=args.train,
+             valid=args.valid == "true", final_eval=args.final_eval)

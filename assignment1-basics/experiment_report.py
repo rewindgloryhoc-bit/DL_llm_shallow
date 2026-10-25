@@ -29,9 +29,13 @@ def _format_duration(seconds):
     return f"{int(hours)}h {int(minutes)}m {secs:.1f}s ({seconds:.1f} s)"
 
 
-def save_loss_curve(steps, loss_set, path, title):
+def save_loss_curve(steps, loss_set, path, title, val_points=None):
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(steps, loss_set, linewidth=0.8)
+    ax.plot(steps, loss_set, linewidth=0.8, label="train")
+    if val_points:
+        val_steps, val_losses = zip(*val_points)
+        ax.plot(val_steps, val_losses, marker="o", markersize=3, linewidth=1.2, label="validation")
+        ax.legend()
     ax.set_xlabel("step")
     ax.set_ylabel("loss")
     ax.set_title(title)
@@ -85,7 +89,8 @@ def _append_mfu_section(lines, mfu_stats):
 
 
 def write_report(experiment_id, start_time, end_time, start_step, step_times, loss_set, hyperparams,
-                 interrupted=False, notes=None, mfu_stats=None, report_dir=REPORT_DIR):
+                 interrupted=False, notes=None, mfu_stats=None, report_dir=REPORT_DIR,
+                 val_points=None, eval_seconds=0.0):
     out_dir = Path(report_dir) / experiment_id
     out_dir.mkdir(parents=True, exist_ok=True)
     plot_path = out_dir / "loss_curve.png"
@@ -93,7 +98,7 @@ def write_report(experiment_id, start_time, end_time, start_step, step_times, lo
 
     steps = list(range(start_step, start_step + len(loss_set)))
     if loss_set:
-        save_loss_curve(steps, loss_set, plot_path, f"{experiment_id}: training loss")
+        save_loss_curve(steps, loss_set, plot_path, f"{experiment_id}: training loss", val_points)
 
     lines = [
         f"# Experiment: {experiment_id}",
@@ -106,9 +111,11 @@ def write_report(experiment_id, start_time, end_time, start_step, step_times, lo
         "",
         f"- **Training start time:** {time.strftime(TIME_FMT, time.localtime(start_time))}",
         f"- **Training end time:** {time.strftime(TIME_FMT, time.localtime(end_time))}",
-        f"- **Total training time:** {_format_duration(end_time - start_time)}",
+        f"- **Total training time:** {_format_duration(end_time - start_time - eval_seconds)}",
         f"- **Steps completed:** {len(step_times)} (step {start_step} to {start_step + len(step_times) - 1})",
     ]
+    if eval_seconds:
+        lines.append(f"- **Validation time (excluded from budget):** {_format_duration(eval_seconds)}")
     if interrupted:
         lines.append("- **Status:** interrupted (Ctrl-C) before reaching the final step")
 
@@ -152,6 +159,19 @@ def write_report(experiment_id, start_time, end_time, start_step, step_times, lo
             "",
             f"![loss curve]({plot_path.name})",
         ]
+
+    if val_points:
+        lines += [
+            "",
+            "## Validation (fixed subset)",
+            "",
+            f"- **Final validation loss:** {val_points[-1][1]:.4f}",
+            f"- **Min validation loss:** {min(v for _, v in val_points):.4f}",
+            "",
+            "| step | val_loss |",
+            "| --- | --- |",
+        ]
+        lines += [f"| {s} | {v:.4f} |" for s, v in val_points]
 
     report_path.write_text("\n".join(lines) + "\n")
     return report_path
